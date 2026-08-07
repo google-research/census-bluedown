@@ -19,7 +19,7 @@ from census_bluedown import ground_truth
 from absl.testing import absltest
 
 
-class GroundTruthTest(googletest.TestCase):
+class GroundTruthTest(absltest.TestCase):
 
   def test_aggregate_microdata_format(self):
     df = pd.DataFrame({

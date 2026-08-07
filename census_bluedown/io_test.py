@@ -26,7 +26,7 @@ from absl.testing import absltest
 Estimate = estimate.Estimate
 
 
-class IoTest(googletest.TestCase):
+class IoTest(absltest.TestCase):
 
   @mock.patch.object(pd, 'read_parquet')
   @mock.patch.object(io.gfile, 'Open')
