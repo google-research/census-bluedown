@@ -126,7 +126,7 @@ class InputFormatIO(AbstractBlockHierarchicalIO):
       raise ValueError('Cannot write to read-only InputFormatIO.')
     output_directory = self.get_directory(level)
     output_file = os.path.join(output_directory, filename)
-    os.makedirs(os.path.dirname(output_file))
+    os.makedirs(os.path.dirname(output_file), exist_ok=True)
     logging.info('Writing file %s', output_file)
     df.to_parquet(output_file)
 
@@ -197,7 +197,7 @@ class ProcessingFormatIO(AbstractBlockHierarchicalIO):
     if self.read_only:
       raise ValueError('Cannot write to read-only ProcessingFormatIO.')
     output_filename = self.get_filename(level, filename)
-    os.makedirs(os.path.dirname(output_filename))
+    os.makedirs(os.path.dirname(output_filename), exist_ok=True)
     if self.split_estimates:
       logging.info('Writing parquet file %s', output_filename)
       expand_estimates(df).to_parquet(output_filename)
@@ -278,6 +278,6 @@ def expand_estimates(df: pd.DataFrame) -> pd.DataFrame:
 
 def write_model(filename, model_proto):
   """Write model to file."""
-  os.makedirs(os.path.dirname(filename))
+  os.makedirs(os.path.dirname(filename), exist_ok=True)
   with open(filename, 'w') as f:
     f.write(text_format.MessageToString(model_proto))

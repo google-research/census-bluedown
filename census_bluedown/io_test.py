@@ -86,7 +86,8 @@ class IoTest(absltest.TestCase):
     input_format_io.write('State', 'file.parquet', mock_df)
 
     mock_make_dirs.assert_called_once_with(
-        './data/State.parquet/DPQuery/State=01'
+        './data/State.parquet/DPQuery/State=01',
+        exist_ok=True,
     )
     mock_df.to_parquet.assert_called_once_with(
         './data/State.parquet/DPQuery/State=01/file.parquet'
@@ -203,8 +204,17 @@ class IoTest(absltest.TestCase):
 
     self.assertEqual(mock_make_dirs.call_count, 2)
     mock_make_dirs.assert_has_calls(
-        [mock.call('./data/State=01/State'),
-         mock.call('./data/State=01/State')])
+        [
+            mock.call(
+                './data/State=01/State',
+                exist_ok=True,
+            ),
+            mock.call(
+                './data/State=01/State',
+                exist_ok=True,
+            )
+        ]
+    )
     mock_df.to_pickle.assert_called_once_with(
         './data/State=01/State/file.pickle'
     )

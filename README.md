@@ -39,6 +39,23 @@ cd census-bluedown
 pip install -r requirements.txt
 ```
 
+## Obtaining Data
+
+Recreating the experiments done in the aforementioned paper requires downloading
+two files:
+
+* [Noisy Measurement File (NMF)](https://www2.census.gov/programs-surveys/decennial/2020/data/01-Redistricting_File--PL_94-171/00-2020-Redistricting-Noisy-Measurement-File/Noisy-Measurement-File-2020-Census-Redistricting-Data.pdf).
+For example, these could be downloaded from
+[Harvard Dataverse](https://doi.org/10.7910/DVN/5LAVKV). For using this
+codebase, we require that `2020-pl94-nmf-parquets.zip` is downloaded
+and extracted at the location `data/2020-pl94-nmf-parquets`.
+* [Privacy-Protected Microdata File (PPMF)](https://www.census.gov/data/tables/2024/dec/2020-census-ppmf.html).
+Specifically, for using this codebase, we require that `2020_ppmf_bystate.zip`
+available at
+[this link](https://www2.census.gov/programs-surveys/decennial/2020/data/privacy-protected-microdata-file),
+is saved at the location `data/2020_ppmf_bystate.zip`. **Note:** This
+should remain as a ZIP file and should not be extracted.
+
 ## Usage
 
 Set `PYTHONPATH=.` before running scripts from the repository root:
@@ -62,9 +79,9 @@ Generate synthetic datasets or ground-truth evaluation tables:
   python3 census_bluedown/generate_synthetic_data.py \
     --pass=ground_truth \
     --state=02 \
-    --nmf_dir=/path/to/raw_nmf/ \
-    --out_dir=/path/to/synthetic-ground-truth/ \
-    --zip_path=/path/to/2020_ppmf_bystate.zip
+    --nmf_dir=data/2020-pl94-nmf-parquets/US_Person_PL_PROD/ \
+    --out_dir=output/synthetic-ground-truth/ \
+    --zip_path=data/2020_ppmf_bystate.zip
   ```
 
 * **Pass 2: Synthetic NMF Generation (`--pass=nmf`)**
@@ -75,8 +92,8 @@ Generate synthetic datasets or ground-truth evaluation tables:
   python3 census_bluedown/generate_synthetic_data.py \
     --pass=nmf \
     --state=002 \
-    --ground_truth_dir=/path/to/synthetic-ground-truth/ \
-    --out_dir=/path/to/synthetic-nmf/
+    --ground_truth_dir=output/synthetic-ground-truth/ \
+    --out_dir=output/synthetic-nmf/
   ```
 
 ---
@@ -94,8 +111,8 @@ individual state subtrees:
 python3 census_bluedown/run_pass.py \
   --pass=bottom_up \
   --state=125 \
-  --nmf_dir=/path/to/synthetic-nmf/ \
-  --out_dir=/path/to/synthetic-processed/
+  --nmf_dir=output/synthetic-nmf/ \
+  --out_dir=output/synthetic-processed/
 ```
 
 #### **Step 2: Bottom-Up Pass (Root Node)**
@@ -104,8 +121,8 @@ Combines state-level totals to construct national (US root) bottom-up totals:
 ```bash
 python3 census_bluedown/run_pass.py \
   --pass=bottom_up \
-  --out_dir=/path/to/synthetic-processed/ \
-  --subtree_totals_dir=/path/to/synthetic-processed/
+  --out_dir=output/synthetic-processed/ \
+  --subtree_totals_dir=output/synthetic-processed/
 ```
 
 #### **Step 3: Top-Down Pass (Root Node)**
@@ -115,9 +132,9 @@ national upper bounds:
 ```bash
 python3 census_bluedown/run_pass.py \
   --pass=top_down \
-  --in_dir=/path/to/synthetic-processed/ \
-  --out_dir=/path/to/synthetic-processed/ \
-  --subtree_totals_dir=/path/to/synthetic-processed/
+  --in_dir=output/synthetic-processed/ \
+  --out_dir=output/synthetic-processed/ \
+  --subtree_totals_dir=output/synthetic-processed/
 ```
 
 #### **Step 4: Top-Down Pass (State Subtrees)**
@@ -128,8 +145,8 @@ using root bounds:
 python3 census_bluedown/run_pass.py \
   --pass=top_down \
   --state=125 \
-  --in_dir=/path/to/synthetic-processed/ \
-  --out_dir=/path/to/synthetic-processed/
+  --in_dir=output/synthetic-processed/ \
+  --out_dir=output/synthetic-processed/
 ```
 
 #### **Alternative Baseline & Error Evaluation Passes**
@@ -140,8 +157,8 @@ python3 census_bluedown/run_pass.py \
   python3 census_bluedown/run_pass.py \
     --pass=baseline_census_topdown \
     --state=125 \
-    --nmf_dir=/path/to/synthetic-nmf/ \
-    --out_dir=/path/to/synthetic-processed/
+    --nmf_dir=output/synthetic-nmf/ \
+    --out_dir=output/synthetic-processed/
   ```
 * **Error Evaluation**:
 
@@ -149,18 +166,9 @@ python3 census_bluedown/run_pass.py \
   python3 census_bluedown/run_pass.py \
     --pass=compute_errors \
     --state=125 \
-    --in_dir=/path/to/synthetic-ground-truth/ \
-    --out_dir=/path/to/synthetic-processed/
+    --in_dir=output/synthetic-ground-truth/ \
+    --out_dir=output/synthetic-processed/
   ```
-
-### Running Tests
-
-To run the unit test suite:
-
-```bash
-PYTHONPATH=. python3 census_bluedown/estimate_test.py
-PYTHONPATH=. python3 census_bluedown/nonlinear_solver_test.py
-```
 
 ## License
 

@@ -18,13 +18,25 @@ Sample usage:
 python3 census_bluedown/run_pass.py \
   --pass=bottom_up \
   --state=125 \
-  --nmf_dir=/path/to/synthetic-nmf/ \
-  --out_dir=/path/to/synthetic-processed/
+  --nmf_dir=output/synthetic-nmf/ \
+  --out_dir=output/synthetic-processed/
 
 python3 census_bluedown/run_pass.py \
   --pass=bottom_up \
-  --out_dir=/path/to/synthetic-processed/ \
-  --subtree_totals_dir=/path/to/synthetic-processed/
+  --out_dir=output/synthetic-processed/ \
+  --subtree_totals_dir=output/synthetic-processed/
+
+python3 census_bluedown/run_pass.py \
+  --pass=top_down \
+  --in_dir=output/synthetic-processed/ \
+  --out_dir=output/synthetic-processed/ \
+  --subtree_totals_dir=output/synthetic-processed/
+
+python3 census_bluedown/run_pass.py \
+  --pass=top_down \
+  --state=125 \
+  --in_dir=output/synthetic-processed/ \
+  --out_dir=output/synthetic-processed/
 """
 
 from collections.abc import Sequence

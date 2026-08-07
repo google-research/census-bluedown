@@ -18,15 +18,15 @@ Sample usage:
 python3 census_bluedown/generate_synthetic_data.py \
   --pass=ground_truth \
   --state=02 \
-  --nmf_dir=/path/to/nmf/ \
-  --out_dir=/path/to/synthetic-ground-truth/ \
-  --zip_path=/path/to/2020_ppmf_bystate.zip
+  --nmf_dir=data/2020-pl94-nmf-parquets/US_Person_PL_PROD/ \
+  --out_dir=output/synthetic-ground-truth/ \
+  --zip_path=data/2020_ppmf_bystate.zip
 
 python3 census_bluedown/generate_synthetic_data.py \
   --pass=nmf \
   --state=002 \
-  --ground_truth_dir=/path/to/synthetic-ground-truth/ \
-  --out_dir=/path/to/synthetic-nmf/
+  --ground_truth_dir=output/synthetic-ground-truth/ \
+  --out_dir=output/synthetic-nmf/
 """
 
 from collections.abc import Sequence
