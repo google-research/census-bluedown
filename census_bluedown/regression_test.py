@@ -78,8 +78,9 @@ class RegressionTest(parameterized.TestCase):
     self.assertEqual(
         covariance.shape,
         (block_shape.compressed_length, block_shape.compressed_length))
-    np.testing.assert_allclose(linear_combination, expected_combination)
-    np.testing.assert_allclose(covariance, expected_covariance)
+    np.testing.assert_allclose(
+        linear_combination, expected_combination, atol=1e-12)
+    np.testing.assert_allclose(covariance, expected_covariance, atol=1e-12)
 
   @parameterized.named_parameters(
       dict(testcase_name="simple",

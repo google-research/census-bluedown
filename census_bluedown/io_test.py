@@ -29,8 +29,8 @@ Estimate = estimate.Estimate
 class IoTest(absltest.TestCase):
 
   @mock.patch.object(pd, 'read_parquet')
-  @mock.patch.object(io.gfile, 'Open')
-  @mock.patch.object(io.gfile, 'ListDir')
+  @mock.patch('builtins.open')
+  @mock.patch('os.listdir')
   def test_InputFormatIO_read(
       self,
       mock_list_dir,
@@ -70,7 +70,7 @@ class IoTest(absltest.TestCase):
                                               engine='pyarrow',
                                               use_threads=False)
 
-  @mock.patch.object(io.gfile, 'MakeDirs')
+  @mock.patch('os.makedirs')
   def test_InputFormatIO_write(self, mock_make_dirs):
     path_prefix = './data'
     subtree_folder = 'State=01'
@@ -92,7 +92,7 @@ class IoTest(absltest.TestCase):
         './data/State.parquet/DPQuery/State=01/file.parquet'
     )
 
-  @mock.patch.object(io.gfile, 'ListDir')
+  @mock.patch('os.listdir')
   def test_InputFormatIO_exists(self, mock_list_dir):
     path_prefix = './data'
     subtree_folder = 'State=01'
@@ -175,7 +175,7 @@ class IoTest(absltest.TestCase):
     )
 
   @mock.patch.object(io, 'expand_estimates')
-  @mock.patch.object(io.gfile, 'MakeDirs')
+  @mock.patch('os.makedirs')
   def test_ProcessingFormatIO_write(
       self,
       mock_make_dirs,
@@ -212,7 +212,7 @@ class IoTest(absltest.TestCase):
         './data/State=01/State/file.parquet'
     )
 
-  @mock.patch.object(io.gfile, 'Exists')
+  @mock.patch('os.path.exists')
   def test_ProcessingFormatIO_exists(self, mock_exists):
     path_prefix = './data'
     subtree_folder = 'State=01'
