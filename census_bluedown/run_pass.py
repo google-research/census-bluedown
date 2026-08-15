@@ -66,8 +66,10 @@ BLOCK_SHAPE = block.BlockShape(
 _PASS = flags.DEFINE_enum(
     name='pass',
     default=None,
-    enum_values=['bottom_up', 'top_down', 'baseline_census_topdown',
-                 'compute_errors', 'compute_alternate_errors', 'test'],
+    enum_values=[
+        'bottom_up', 'top_down', 'baseline_census_topdown',
+        'compute_errors', 'compute_alternate_errors',
+    ],
     help='Pass to run.',
     required=True,
 )
