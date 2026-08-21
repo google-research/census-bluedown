@@ -16,9 +16,11 @@
 """
 
 from collections.abc import Sequence
+import itertools
 
 import numpy as np
 import pandas as pd
+
 from census_bluedown import constants
 from census_bluedown import io
 
@@ -65,7 +67,11 @@ QUERY_LAMBDAS = {
     for query in QUERY_DICT
 }
 
-# Alternate query names for queries in spreadsheet released by census.
+# Names of a subset of detailed summary queries released by the Census Bureau.
+# https://www.census.gov/programs-surveys/decennial-census/technical-documentation/complete-technical-documents.2020.html
+# Detailed Summary Metrics available in the following spreadsheet:
+# "2020 Census Production Disclosure Avoidance System Detailed Summary Metrics"
+# https://www2.census.gov/programs-surveys/decennial/2020/data/demographic-and-housing-characteristics-file/2020-Census-Disclosure-Avoidance-System-Detailed-Summary-Metrics.xlsx
 VOTINGAGE_QUERY = 'VOTINGAGE_vector'
 HISPANIC_QUERY = 'HISP_vector'
 CENRACE_ALONE_QUERY = 'Race_alone'  # Each option alone, or >= 2 races
@@ -340,71 +346,32 @@ def compute_errors(
     processed_io.write(level, constants.ERRORS_FNAME, df_combined)
 
 
-def race_counts_combined_transformation_matrix():
+def race_counts_combined_transformation_matrix(
+    num_races: int = 6,
+) -> np.ndarray:
   """Produces a transformation matrix for aggregating per-race counts.
 
   Returns a 63 x 6 matrix applying a transformation to count how many
   individuals belong to each possible primary race category (White, Black, AIAN,
   Asian, NHPI, SOR), either alone or in combination with the other races.
 
+  Args:
+    num_races: The number of primary race categories.
+
   Returns:
-    A 63 x 6 numpy array.
+    A 63 x 6 numpy array, or more generally a (2^num_races - 1) x num_races
+    numpy array.
   """
+  combos = list(
+      itertools.chain.from_iterable(
+          itertools.combinations(range(num_races), r)
+          for r in range(1, num_races + 1)
+      )
+  )
 
-  # Mapping from 1-based index to the races in that combination
-  race_combinations = {
-      1: ['White'], 2: ['Black'], 3: ['AIAN'], 4: ['Asian'], 5: ['NHPI'],
-      6: ['SOR'], 7: ['White', 'Black'], 8: ['White', 'AIAN'],
-      9: ['White', 'Asian'], 10: ['White', 'NHPI'], 11: ['White', 'SOR'],
-      12: ['Black', 'AIAN'], 13: ['Black', 'Asian'], 14: ['Black', 'NHPI'],
-      15: ['Black', 'SOR'], 16: ['AIAN', 'Asian'], 17: ['AIAN', 'NHPI'],
-      18: ['AIAN', 'SOR'],
-      19: ['Asian', 'NHPI'], 20: ['Asian', 'SOR'], 21: ['NHPI', 'SOR'],
-      22: ['White', 'Black', 'AIAN'], 23: ['White', 'Black', 'Asian'],
-      24: ['White', 'Black', 'NHPI'], 25: ['White', 'Black', 'SOR'],
-      26: ['White', 'AIAN', 'Asian'], 27: ['White', 'AIAN', 'NHPI'],
-      28: ['White', 'AIAN', 'SOR'], 29: ['White', 'Asian', 'NHPI'],
-      30: ['White', 'Asian', 'SOR'], 31: ['White', 'NHPI', 'SOR'],
-      32: ['Black', 'AIAN', 'Asian'], 33: ['Black', 'AIAN', 'NHPI'],
-      34: ['Black', 'AIAN', 'SOR'], 35: ['Black', 'Asian', 'NHPI'],
-      36: ['Black', 'Asian', 'SOR'], 37: ['Black', 'NHPI', 'SOR'],
-      38: ['AIAN', 'Asian', 'NHPI'], 39: ['AIAN', 'Asian', 'SOR'],
-      40: ['AIAN', 'NHPI', 'SOR'], 41: ['Asian', 'NHPI', 'SOR'],
-      42: ['White', 'Black', 'AIAN', 'Asian'],
-      43: ['White', 'Black', 'AIAN', 'NHPI'],
-      44: ['White', 'Black', 'AIAN', 'SOR'],
-      45: ['White', 'Black', 'Asian', 'NHPI'],
-      46: ['White', 'Black', 'Asian', 'SOR'],
-      47: ['White', 'Black', 'NHPI', 'SOR'],
-      48: ['White', 'AIAN', 'Asian', 'NHPI'],
-      49: ['White', 'AIAN', 'Asian', 'SOR'],
-      50: ['White', 'AIAN', 'NHPI', 'SOR'],
-      51: ['White', 'Asian', 'NHPI', 'SOR'],
-      52: ['Black', 'AIAN', 'Asian', 'NHPI'],
-      53: ['Black', 'AIAN', 'Asian', 'SOR'],
-      54: ['Black', 'AIAN', 'NHPI', 'SOR'],
-      55: ['Black', 'Asian', 'NHPI', 'SOR'],
-      56: ['AIAN', 'Asian', 'NHPI', 'SOR'],
-      57: ['White', 'Black', 'AIAN', 'Asian', 'NHPI'],
-      58: ['White', 'Black', 'AIAN', 'Asian', 'SOR'],
-      59: ['White', 'Black', 'AIAN', 'NHPI', 'SOR'],
-      60: ['White', 'Black', 'Asian', 'NHPI', 'SOR'],
-      61: ['White', 'AIAN', 'Asian', 'NHPI', 'SOR'],
-      62: ['Black', 'AIAN', 'Asian', 'NHPI', 'SOR'],
-      63: ['White', 'Black', 'AIAN', 'Asian', 'NHPI', 'SOR']
-  }
-
-  primary_races = ['White', 'Black', 'AIAN', 'Asian', 'NHPI', 'SOR']
-
-  # Create the mapping from primary race to its corresponding 0-based indices
-  race_indices_map = {race: [k-1 for k, v in race_combinations.items()
-                             if race in v]
-                      for race in primary_races}
-
-  # Create the 63x6 transformation matrix
-  transformation_matrix = np.zeros((63, 6), dtype=int)
-  for i, race in enumerate(primary_races):
-    transformation_matrix[race_indices_map[race], i] = 1
+  transformation_matrix = np.zeros((len(combos), num_races), dtype=int)
+  for row, combo in enumerate(combos):
+    transformation_matrix[row, list(combo)] = 1
 
   return transformation_matrix
 
@@ -415,7 +382,7 @@ def compute_alternate_errors(
     processed_io: io.AbstractBlockHierarchicalIO,
     constraint_io: io.AbstractBlockHierarchicalIO,
 ):
-  """Compute alternate error metrics from spreadsheet released by census.
+  """Compute detailed summary metrics released by the Census Bureau.
 
   Postprocesses each input block individually in the specified subtree.
 
@@ -619,4 +586,3 @@ def aggregate_errors(
   combined_df = combined_df.rename(columns={'level_0': 'level',
                                             'level_1': 'query'})
   processed_io.write(constants.ROOT_LEVEL, file_name, combined_df)
-
