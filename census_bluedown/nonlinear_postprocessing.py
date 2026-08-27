@@ -17,6 +17,7 @@
 import logging
 
 import pandas as pd
+
 from census_bluedown import block
 from census_bluedown import constants
 from census_bluedown import nonlinear_solver

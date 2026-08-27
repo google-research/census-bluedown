@@ -19,7 +19,6 @@ from collections.abc import Sequence
 import datetime
 
 from absl import logging
-
 import numpy as np
 
 from census_bluedown import block
@@ -714,7 +713,7 @@ def aggregate_to_query_shape(
   effective_shape = (target_shape
                      if target_shape != constants.CENSUS_ASYMMETRIC_QUERY_SHAPE
                      else (8, 1, 1, 1))
-  values = (np.reshape(values, initial_shape)
+  values = (np.reshape(values, initial_shape)  # pyrefly: ignore[bad-assignment]
             .sum(axis=tuple(np.flatnonzero(np.array(effective_shape) == 1)))
             .reshape(-1))
   if target_shape == constants.CENSUS_ASYMMETRIC_QUERY_SHAPE:

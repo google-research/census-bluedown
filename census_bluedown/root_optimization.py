@@ -21,7 +21,6 @@ children.
 from collections.abc import Sequence
 
 from absl import logging
-
 import numpy as np
 
 from census_bluedown import block

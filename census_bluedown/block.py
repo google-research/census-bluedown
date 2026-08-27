@@ -15,7 +15,7 @@
 """Compressed data format for estimates and covariance with symmetric structure.
 """
 
-from collections.abc import Sequence, Iterator
+from collections.abc import Iterator, Sequence
 import dataclasses
 import itertools
 from typing import TypeAlias

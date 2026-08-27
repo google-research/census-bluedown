@@ -326,5 +326,3 @@ def generate_us_total_ground_truth(
   out_constraint_io.write(level=constants.ROOT_LEVEL,
                           filename=constants.CONSTRAINT_FNAME,
                           df=constraint_df)
-
-

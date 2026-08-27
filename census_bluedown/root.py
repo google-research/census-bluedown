@@ -17,9 +17,9 @@
 from collections.abc import Sequence
 
 from absl import logging
-
 import numpy as np
 import pandas as pd
+
 from census_bluedown import block
 from census_bluedown import constants
 from census_bluedown import constrain

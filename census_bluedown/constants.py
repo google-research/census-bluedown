@@ -130,6 +130,7 @@ EXTENSION = PARQUET_EXTENSION
 GROUND_TRUTH_FNAME = 'ground_truth' + PARQUET_EXTENSION
 NMF_FNAME = 'nmf' + PARQUET_EXTENSION
 CONSTRAINT_FNAME = 'constraints'
+# pylint: disable=invalid-name
 SUBTREE_TOTALS_FNAME = 'state_totals' + EXTENSION
 BLOCK_EST_FNAME = 'block_estimate' + EXTENSION
 LOWER_EST_FNAME = 'lower_estimate' + EXTENSION
@@ -146,6 +147,7 @@ if not CONSTRAIN_BOTTOM_UP:
   LOWER_EST_FNAME = 'lower_unconstrained' + EXTENSION
   COMBINED_EST_FNAME = 'combined_unconstrained' + EXTENSION
   OPTIMIZED_EST_FNAME = 'optimized_unconstrained' + EXTENSION
+# pylint: enable=invalid-name
 
 
 NMF_PATH_SUFFIX = '.parquet/DPQuery/'
