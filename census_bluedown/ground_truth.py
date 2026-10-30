@@ -23,20 +23,13 @@ import pandas as pd
 
 from census_bluedown import constants
 from census_bluedown import io
+from census_bluedown import query_encoding
 
 
 GEOCODE16 = 'geocode16'
-GEOCODE_PREFIX = 'geocode_prefix'
-REDISTRICTING_FEATURE = 'redistricting_feature'
 VALUE = constants.VALUE
 ID = constants.ID
-
-
-def onehot_encode(x: int) -> np.ndarray:
-  """Encode an integer in [0, 2015] as one-hot vector of length 2016."""
-  encoding = np.zeros(2016, dtype=int)
-  encoding[x] = 1
-  return encoding
+QUERY_SHAPE = constants.QUERY_SHAPE
 
 
 def handle_water_block_patch(series: pd.Series) -> pd.Series:
@@ -87,7 +80,9 @@ def aggregate_microdata_format(
     - value: The redistricting feature value, as a length-2016 numpy array.
   """
   geo16_cols = ['TABBLKST', 'TABBLKCOU', 'TABTRACTCE', 'TABBLKGRPCE', 'TABBLK']
-  df[GEOCODE16] = handle_water_block_patch(df[geo16_cols].agg(''.join, axis=1))
+  geocode16 = handle_water_block_patch(
+      df[geo16_cols[0]].str.cat(df[geo16_cols[1:]])
+  )
 
   # Combine the four feature values into a single field.
   # The encoding from most-significant-bit to least-significant-bit is:
@@ -95,29 +90,27 @@ def aggregate_microdata_format(
   #   voting_age: 1--2
   #   hispanic: 1--2
   #   cenrace: 01--63
-  # The range of the combined feature is 0--2015.
-  hhgq = 'GQTYPE_PL'
-  voting_age = 'VOTING_AGE'
-  hispanic = 'CENHISP'
-  cenrace = 'CENRACE'
-  df[REDISTRICTING_FEATURE] = df.apply(
-      lambda x: (
-          (
-              (
-                  int(x[hhgq]) * 2
-                  + int(x[voting_age]) - 1
-              ) * 2
-              + int(x[hispanic]) - 1
-          ) * 63
-          + int(x[cenrace]) - 1
-      ), axis=1
+  # The range of the combined feature is 0--2015. np.ravel_multi_index raises
+  # a ValueError if any feature value is out of range.
+  feature = np.ravel_multi_index(
+      (
+          df['GQTYPE_PL'].astype(np.int64).to_numpy(),
+          df['VOTING_AGE'].astype(np.int64).to_numpy() - 1,
+          df['CENHISP'].astype(np.int64).to_numpy() - 1,
+          df['CENRACE'].astype(np.int64).to_numpy() - 1,
+      ),
+      constants.DETAILED_QUERY_SHAPE,
   )
 
-  # Encode the redistricting feature as a histogram so we can aggregate it.
-  df[VALUE] = df[REDISTRICTING_FEATURE].apply(onehot_encode)
-
-  # Return data aggregated over geocode.
-  return df[[GEOCODE16, VALUE]].groupby(GEOCODE16).sum()
+  # Aggregate over geocode by counting (geocode, feature) pairs.
+  geocode_codes, geocodes = pd.factorize(geocode16, sort=True)
+  counts = np.bincount(
+      geocode_codes * constants.TOTAL_LEN + feature,
+      minlength=len(geocodes) * constants.TOTAL_LEN,
+  ).reshape(len(geocodes), constants.TOTAL_LEN)
+  return pd.DataFrame(
+      {VALUE: list(counts)}, index=pd.Index(geocodes, name=GEOCODE16)
+  )
 
 
 def read_state_microdata_format(
@@ -186,25 +179,63 @@ def split_df_by_constraint_dfs(
   return out_dfs
 
 
-def aggregate_query_values(row: pd.Series) -> np.ndarray:
-  """Subroutine to aggregate all queries appropriately."""
-  if row['query_name'] == 'detailed_dpq':
-    return np.array(row['value'])
+def project_to_query_shapes(df: pd.DataFrame) -> list[np.ndarray]:
+  """Projects each row's detailed histogram to the row's query shape.
 
-  shape = row['query_shape']
-  effective_shape = shape
-  if row['query_name'] == 'hhinstlevels_dpq':
-    effective_shape = [8, 1, 1, 1]
+  Args:
+    df: A dataframe with columns QUERY_SHAPE and VALUE, where each VALUE is a
+      detailed histogram.
 
-  values = (np.reshape(row['value'], [8, 2, 2, 63])
-            .sum(axis=tuple(np.flatnonzero(np.array(effective_shape) == 1)))
-            .reshape(-1))
+  Returns:
+    A list with, for each row, the projection of VALUE to QUERY_SHAPE.
+  """
+  return [
+      query_encoding.project_to_query_shape(value, query_shape)
+      for value, query_shape in zip(df[VALUE], df[QUERY_SHAPE])
+  ]
 
-  if row['query_name'] == 'hhinstlevels_dpq':
-    values = np.array([values[0],
-                       values[1] + values[2] + values[3] + values[4],
-                       values[5] + values[6] + values[7]])
-  return values
+
+def _histograms_by_id(df: pd.DataFrame) -> pd.DataFrame:
+  """Stacks the VALUE histograms of df into a numeric DataFrame indexed by ID.
+
+  Args:
+    df: A DataFrame with columns ID and VALUE, where each VALUE is a detailed
+      histogram. May be empty.
+
+  Returns:
+    A DataFrame with one row per row of df and one numeric column per histogram
+    entry, indexed by ID.
+  """
+  return pd.DataFrame(
+      np.stack(df[VALUE].to_numpy())
+      if len(df)
+      else np.zeros((0, constants.TOTAL_LEN), dtype=np.int64),
+      index=df[ID].to_numpy(),
+  )
+
+
+def _aggregate_histograms_to_ids(
+    histograms: pd.DataFrame, ids: Sequence[str]
+) -> tuple[pd.DataFrame, list[np.ndarray]]:
+  """Aggregates histograms to the regions identified by ids.
+
+  Regions are identified by geocode prefixes, so the histograms are summed over
+  all index labels sharing the first len(ids[0]) characters.
+
+  Args:
+    histograms: Numeric DataFrame with one histogram per row, indexed by
+      geocode.
+    ids: The geocodes of the regions to aggregate to, all of the same length.
+
+  Returns:
+    The aggregated histograms indexed by geocode prefix, and the histogram of
+    each region in ids in order, with a histogram of zeros for regions whose
+    prefix matches no row of histograms.
+  """
+  prefix_length = len(ids[0])
+  aggregated = histograms.groupby(histograms.index.str[:prefix_length]).sum()
+  values = list(aggregated.reindex(ids, fill_value=0).to_numpy())
+  return aggregated, values
 
 
 def generate_single_subtree_ground_truth(
@@ -227,15 +258,15 @@ def generate_single_subtree_ground_truth(
     constraint_io: The input IO object for the constraint data.
     out_io: The output IO object for the ground truth data.
     out_constraint_io: The output IO object for the constraint data.
-
-  Returns:
-    The overall histogram for the subtree.
   """
   nmf_io.subtree_folder = constants.SUBTREE_FOLDER_PATTERN % subtree
   out_io.subtree_folder = constants.SUBTREE_FOLDER_PATTERN % subtree
   constraint_io.subtree_folder = constants.SUBTREE_FOLDER_PATTERN % subtree
   out_constraint_io.subtree_folder = constants.SUBTREE_FOLDER_PATTERN % subtree
 
+  # Histograms as a numeric matrix with one row per geocode. Each level is
+  # aggregated from the previous (finer) level, since geocode prefixes nest.
+  histograms = _histograms_by_id(df)
   for level in reversed(constants.LEVELS):
     try:
       constraint_df = constraint_io.read(level, None)
@@ -247,20 +278,12 @@ def generate_single_subtree_ground_truth(
       nmf_df = nmf_io.read(level, None)
     except FileNotFoundError:
       continue
-    df[GEOCODE_PREFIX] = df[ID].str[:len(nmf_df[ID].iloc[0])]
-    df = df.groupby(GEOCODE_PREFIX).sum()
-    df = df.reset_index()
-    nmf_df = nmf_df.drop(VALUE, axis=1)
-    out_df = pd.merge(nmf_df, df[[GEOCODE_PREFIX, VALUE]], how='left',
-                      left_on=ID, right_on=GEOCODE_PREFIX)
-
-    # Fill missing values with zeros.
-    out_df[VALUE] = out_df[VALUE].apply(
-        lambda x: [0] * 2016 if np.all(pd.isna(x)) else x
+    out_df = nmf_df.drop(VALUE, axis=1).reset_index(drop=True)
+    # Regions with no records get a histogram of zeros.
+    histograms, out_df[VALUE] = _aggregate_histograms_to_ids(
+        histograms, out_df[ID].to_list()
     )
-
-    out_df[VALUE] = out_df.apply(aggregate_query_values, axis=1)
-    out_df = out_df.drop(GEOCODE_PREFIX, axis=1)
+    out_df[VALUE] = project_to_query_shapes(out_df)
     out_io.write(level, constants.GROUND_TRUTH_FNAME, out_df)
 
 
@@ -275,6 +298,9 @@ def generate_state_ground_truth(
 ) -> None:
   """Generate ground truth for a single state.
 
+  Writes the ground truth values and constraint data for each subtree of the
+  state to the output IO objects.
+
   Args:
     state: The state code, as a length-2 string between '01' and '56'.
     df: The aggregated microdata format data for the state, with columns
@@ -284,14 +310,11 @@ def generate_state_ground_truth(
     out_io: The output IO object for the ground truth data.
     out_constraint_io: The output IO object for the constraint data.
     subtree_patterns: The patterns for the geocodes of the subtrees.
-
-  Returns:
-    The overall histogram for the state.
   """
   subtrees = set(x % state for x in subtree_patterns).intersection(
       constants.FOLDER_IDS
   )
-  if len(subtrees) < 0 or len(subtrees) > 2:
+  if not 1 <= len(subtrees) <= 2:
     raise ValueError(
         f'Expected 1 or 2 subtrees for state {state}, got {len(subtrees)}.')
 
@@ -319,7 +342,7 @@ def generate_us_total_ground_truth(
   """Write the US-level ground truth."""
   df = nmf_io.read(constants.ROOT_LEVEL, None)
   df[VALUE] = [us_total] * len(df)
-  df[VALUE] = df.apply(aggregate_query_values, axis=1)
+  df[VALUE] = project_to_query_shapes(df)
   out_io.write(constants.ROOT_LEVEL, constants.GROUND_TRUTH_FNAME, df)
 
   constraint_df = constraint_io.read(constants.ROOT_LEVEL, None)

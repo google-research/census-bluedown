@@ -15,33 +15,41 @@
 """Nonlinear solver for the block hierarchical postprocessing algorithm.
 """
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 import datetime
-
 from absl import logging
 import numpy as np
-
-from census_bluedown import block
 from census_bluedown import constants
 from census_bluedown import estimate
+from census_bluedown import query_encoding
+from census_bluedown import succinct
 from ortools.math_opt.python import mathopt
 
 
 SOLVER = constants.SOLVER
-
+ALPHA_VALUES = constants.ALPHA_VALUES
 MULTIFEATURE_ZERO_SEQUENCE = constants.MULTIFEATURE_ZERO_SEQUENCE
+
+DETAILED_SHAPE = constants.DETAILED_QUERY_SHAPE  # (8, 2, 2, 63)
+ASYM_LEN = constants.COEFFICIENT_DIM  # 32
+SYM_LEN = constants.PROJECTION_DIM  # 63
+TOTAL_LEN = constants.TOTAL_LEN  # 2016
 
 
 def do_solve(
     model: mathopt.Model,
     *,
-    timeout_minutes: int = 30
+    timeout_minutes: int = 30,
+    solve_parameters: mathopt.SolveParameters | None = None,
+    use_simplex: bool = False,
 ) -> mathopt.SolveResult:
   """Solve the given model using Gurobi or SCIP.
 
   Args:
     model: The model to solve.
     timeout_minutes: The timeout for the solver.
+    solve_parameters: Optional SolveParameters to pass to the solver.
+    use_simplex: If True, use Gurobi dual simplex instead of barrier.
 
   Returns:
     The result of the solve.
@@ -51,27 +59,35 @@ def do_solve(
     RuntimeError: If the solver fails to find an optimal solution.
   """
   if SOLVER == constants.SolverType.GUROBI:
-    logging.info('Invoking Gurobi solver.')
+    if use_simplex:
+      logging.info('Invoking Gurobi dual simplex solver.')
+      gurobi_params = {'Method': '1', 'numericFocus': '3'}
+    else:
+      logging.info('Invoking Gurobi solver.')
+      gurobi_params = {'numericFocus': '3', 'BarHomogeneous': '1'}
     time_limit = datetime.timedelta(minutes=timeout_minutes)
     result = mathopt.solve(
         model=model,
         solver_type=mathopt.SolverType.GUROBI,
         params=mathopt.SolveParameters(
             time_limit=time_limit,
-            gurobi=mathopt.GurobiParameters({
-                'numericFocus': '3',
-                'BarHomogeneous': '1'})),
+            gurobi=mathopt.GurobiParameters(gurobi_params)),
         msg_cb=lambda msgs: mathopt.log_messages(msgs, prefix='[solver] '),
     )
   elif SOLVER == constants.SolverType.SCIP:
     logging.info('Invoking SCIP solver.')
-    result = mathopt.solve(model, mathopt.SolverType.GSCIP,
-                           params=mathopt.SolveParameters(enable_output=True))
+    params = solve_parameters or mathopt.SolveParameters(enable_output=True)
+    result = mathopt.solve(model, mathopt.SolverType.GSCIP, params=params)
   else:
     raise ValueError(f'Unsupported solver: {SOLVER}')
 
   if result.termination.reason != mathopt.TerminationReason.OPTIMAL:
-    raise RuntimeError(f'model failed to solve: {result.termination}')
+    reason_name = getattr(
+        result.termination.reason, 'name', str(result.termination.reason)
+    )
+    raise RuntimeError(
+        f'model failed to solve ({reason_name}): {result.termination}'
+    )
 
   logging.info('Optimal solution returned.')
   return result
@@ -79,13 +95,16 @@ def do_solve(
 
 def variable_values(
     result: mathopt.SolveResult,
-    ests: Sequence[mathopt.Variable | float]
+    ests: Sequence[mathopt.Variable | float],
 ) -> Sequence[float]:
-  """Extract variable values from solve result."""
-  return [result.variable_values(est)
-          if isinstance(est, mathopt.Variable)
-          else est
-          for est in ests]
+  """Extract nonnegative variable values from solve result."""
+  var_vals = [
+      result.variable_values(est) if isinstance(est, mathopt.Variable) else est
+      for est in ests
+  ]
+  if any(val < -1e-4 for val in var_vals):
+    raise RuntimeError(f'Variable values {var_vals} are negative.')
+  return [max(0.0, float(val)) for val in var_vals]
 
 
 def integer_variable_values(
@@ -162,7 +181,6 @@ def add_sum_range_constraint(
 
 
 def add_feature_constraints(
-    block_shape: block.BlockShape,
     model: mathopt.Model,
     variables: Sequence[mathopt.Variable],
     lower_bounds: Sequence[int],
@@ -178,7 +196,6 @@ def add_feature_constraints(
   constraint, since these variables are already defined to be zero.
 
   Args:
-    block_shape: The BlockShape object describing the block structure.
     model: The model to add constraints to.
     variables: The variables to constrain.
     lower_bounds: The lower bounds for each feature value.
@@ -187,15 +204,17 @@ def add_feature_constraints(
 
   Raises:
     ValueError if `lower_bounds` or `upper_bounds` have length different
-    from `block_shape.shape[0]`.
+    from `DETAILED_SHAPE[0]` (which is 8).
   """
-  if (len(lower_bounds) != block_shape.shape[0] or
-      len(upper_bounds) != block_shape.shape[0]):
+  if (
+      len(lower_bounds) != DETAILED_SHAPE[0]
+      or len(upper_bounds) != DETAILED_SHAPE[0]
+  ):
     raise ValueError('Length of bounds must match size of first feature.')
 
-  values_per_chunk = block_shape.length // block_shape.shape[0]
+  values_per_chunk = TOTAL_LEN // DETAILED_SHAPE[0]
 
-  for i in range(block_shape.shape[0]):
+  for i in range(DETAILED_SHAPE[0]):
     next_offsets = (offsets[values_per_chunk * i : values_per_chunk * (i+1)]
                     if offsets is not None else None)
     add_sum_range_constraint(
@@ -236,265 +255,169 @@ def add_parent_sum_constraints(
     )
 
 
-def condition_covariance_matrix(
-    block_shape: block.BlockShape,
-    covariance_matrix: np.ndarray,
-    constrained_total: bool,
-    upper_bounds: Sequence[int]
-) -> np.ndarray:
-  """Condition covariance matrix based on constraints to avoid numerical issues.
-
-  The covariance matrix is PSD, but due to constraints that were already applied
-  in the linear pass, the matrix may be singular. This function modifies the
-  covariance matrix to make it positive-definite by adding terms in the
-  direction of the constraints. This does not affect the optimization solution,
-  since the same constraints are enforced in the optimization problem.
-
-  Three constraints are handled, corresponding to the equality constraints that
-  may have been applied in the linear pass:
-  1. The multifeature zero constraint
-  2. The first feature upper bound constraint in the case that the upper bound
-      is zero
-  3. The total constraint for nodes whose total value is constrained (the root,
-      as well as nodes corresponding to the total for a state without an AIAN
-      region)
-
-  Args:
-    block_shape: The BlockShape object describing the block structure.
-    covariance_matrix: The covariance matrix to condition.
-    constrained_total: Whether the covariance matrix constrains the total.
-    upper_bounds: The upper bounds for each first feature value.
-
-  Returns:
-    The conditioned covariance matrix.
-  """
-  condition_offset = np.zeros_like(covariance_matrix)
-  if constrained_total:
-    tiled_copies = [x // 2 for x in covariance_matrix.shape]
-    condition_offset += (constants.CONDITION_SCALING *
-                         np.tile(np.array([[0, 0], [0, 1]]), tiled_copies))
-
-  multifeature_zero_indices = (24, 25, 26, 27)
-  if upper_bounds[MULTIFEATURE_ZERO_SEQUENCE[0]] > 0:
-    # Ensure multifeature zero constraint directions are non-singular.
-    diag_values = np.zeros(block_shape.compressed_length)
-    for i in multifeature_zero_indices:
-      diag_values[i] = 1
-    condition_offset += constants.CONDITION_SCALING * np.diag(diag_values)
-
-  # Ensure upper bound zero constraint directions are non-singular.
-  values_per_first_feature = (block_shape.compressed_length //
-                              block_shape.shape[0])
-  diag_values = [1 if upper_bounds[i // values_per_first_feature] == 0 else 0
-                 for i in range(block_shape.compressed_length)]
-  condition_offset += constants.CONDITION_SCALING * np.diag(diag_values)
-
-  return covariance_matrix + condition_offset
-
-
-def generate_full_objective_terms(
-    model: mathopt.Model | None,
-    block_shape: block.BlockShape,
+def generate_succinct_full_objective_terms(
+    model: mathopt.Model,
     geocode: str,
     est: estimate.Estimate,
     variables: Sequence[mathopt.Variable | float],
-    first_feature_upper_bounds: Sequence[int],
-    constrained_total: bool
+    cons: succinct.SuccinctConstraint,
+    alpha: float = 50.0,
 ) -> Sequence[mathopt.QuadraticTypes]:
-  """Generate objective terms for the model.
+  """Generate full-pass objective terms using succinct representation.
 
-  Uses compressed precision matrix to generate objective terms for the model.
-  The sum of the objective terms is given by the formula (y - b)^T @ P @ (y - b)
-  where y is the estimate vector and b is the variable vector. The precision
-  matrix P is the inverse of the covariance matrix of the estimate.
-
-  If model is None, then the variables are assumed to be floats rather than
-  mathopt variables, and the function will simply return a list of floats and
-  will not add any partial sum dummy variables or constraints to the model. This
-  is used for testing.
+  Uses the succinct precision matrix P = (cov + alpha R^T R)^-1 to generate
+  objective terms for the model. The sum of the objective terms is given by the
+  formula (z - z_hat)^T P (z - z_hat), where z_hat is the estimate vector and z
+  is the variable vector. Let A ⊆ {0, ..., ASYM_LEN - 1} (`active_rows`) be the
+  set of active asymmetric row indices (those containing `mathopt.Variable`s;
+  the remaining rows were fixed to 0.0 by `add_variable` for cells constrained
+  to zero, and `cons` encodes the same zero constraints for the alpha
+  regularization). Restricting to the rows in A and using the Cholesky
+  decomposition P_AA = L L^T, this quadratic form is expressed as y^T y where
+  y = L^T (z_A - z_hat_A), reducing the objective to SYM_LEN * |A| diagonal
+  squared terms.
 
   Args:
     model: The model to generate objective terms for.
-    block_shape: The BlockShape object describing the block structure.
-    geocode: The geocode of the block, used for naming the partial sum dummy
-      variables.
-    est: The estimate of the block.
-    variables: The variables for the block.
-    first_feature_upper_bounds: The upper bounds for each first feature value.
-    constrained_total: Whether the total value is constrained in the input
-      estimate.
+    geocode: The geocode of the block, used for naming the auxiliary variables.
+    est: The estimate of the block, whose covariance must be a
+      SuccinctCovariance.
+    variables: The variables for the block. Entries constrained to zero are
+      floats (0.0) rather than variables.
+    cons: The local SuccinctConstraint for the block.
+    alpha: Conditioning parameter for the local constraints.
 
   Returns:
-    A list of quadratic expressions or floats, depending on whether a model is
-    provided.
+    A list of quadratic expressions.
+
+  Raises:
+    TypeError: If est.cov is not a SuccinctCovariance.
+    ValueError: If an entry in an inactive row differs from est.val by more
+      than 1e-4.
   """
-  if block_shape.num_features != block_shape.num_asymmetric_features +  1:
-    raise ValueError('Current implementation of generate_full_objective_terms'
-                     'requires there to be a single symmetric feature.')
+  if not isinstance(est.cov, succinct.SuccinctCovariance):
+    raise TypeError('Expected SuccinctCovariance')
 
-  # Split the variables and estimate values into sublists corresponding to each
-  # possible value of the asymmetric features.
-  symmetric_feature_length = block_shape.uncompressed_symmetric_length
-  variable_sublists = [
-      variables[i:i+symmetric_feature_length]
-      for i in range(0, block_shape.length, symmetric_feature_length)
+  prec = (est.cov + cons.gram() * alpha).inv()
+  diff = np.asarray(variables) - est.val
+  diffs = np.reshape(diff, (ASYM_LEN, SYM_LEN))
+  active_rows = [
+      a
+      for a in range(ASYM_LEN)
+      if any(isinstance(v, mathopt.LinearBase) for v in diffs[a])
   ]
-  estimate_sublists = [
-      est.val[i:i+symmetric_feature_length]
-      for i in range(0, block_shape.length, symmetric_feature_length)
+  inactive_rows = [a for a in range(ASYM_LEN) if a not in active_rows]
+  if (np.abs(diffs[inactive_rows].astype(float)) > 1e-4).any():
+    raise ValueError('Inactive rows must have zero difference from est.val.')
+  diffs_active = diffs[active_rows]
+  num_active = len(active_rows)
+
+  # Instead of generating dense mathopt.LinearExpressions for row means over the
+  # symmetric feature, introduce |A| auxiliary variables representing the mean
+  # difference across the symmetric feature for each active asymmetric feature
+  # combination. This keeps the subsequent linear constraints sparse.
+  delta_bar = [
+      model.add_variable(name=f'delta_bar_{geocode}_{row}')
+      for row in active_rows
   ]
+  for k in range(num_active):
+    model.add_linear_constraint(
+        delta_bar[k] == mathopt.fast_sum(diffs_active[k, :]) / SYM_LEN
+    )
 
-  # Generate partial sums of the estimate and variable sublists.
-  estimate_partial_sums = [sum(x) for x in estimate_sublists]
-
-  if model is None:
-    # If model is None (which is used for testing purposes), then the variables
-    # are floats rather than mathopt variables and we don't need to generate
-    # partial sum dummy variables or constraints.
-    partial_sum_variables = [
-        sum(x) for x in variable_sublists
-    ]
-  else:
-    # Instead of generating mathopt.LinearExpressions for sums of variables,
-    # generate partial sum dummy variables corresponding to the sum over
-    # possible values of the symmetric feature for each combination of values of
-    # the asymmetric features.
-    partial_sum_variables = [
-        model.add_variable(lb=0, name=f'x_{geocode}_partial_sum_{i}')
-        for i in range(block_shape.asymmetric_length)
-    ]
-    for i in range(block_shape.asymmetric_length):
-      model.add_linear_constraint(
-          partial_sum_variables[i] == mathopt.fast_sum(variable_sublists[i]))
-
-  # Differences between variables and estimates for each asymmetric feature.
-  # Can't use np.array because it doesn't support mathopt.linearExpressions
-  differences = [
-      [x - y for x, y in zip(variable_sublists[i], estimate_sublists[i])]
-      for i in range(block_shape.asymmetric_length)
-  ]
-
-  # Generate objective function terms for each combination of values of the
-  # asymmetric features.
-  if constants.CONSTRAIN_BOTTOM_UP:
-    # If bottom-up constraints are used, then the covariance matrix is singular
-    # and we need to condition it to avoid numerical issues and ensure PSD.
-    cov_matrix = condition_covariance_matrix(
-        block_shape=block_shape,
-        covariance_matrix=est.cov,
-        constrained_total=constrained_total,
-        upper_bounds=first_feature_upper_bounds)
-  else:
-    cov_matrix = est.cov
-  compressed_precision_matrix = np.linalg.inv(cov_matrix)
-
+  # Write P_AA = C_0 ⊗ P_0 + C_1 ⊗ P_1 and let L_0, L_1 be the Cholesky factors
+  # of C_0, C_1, so that L = L_0 ⊗ P_0 + L_1 ⊗ P_1 satisfies P_AA = L L^T (this
+  # is what SuccinctCovariance.cholesky returns). View the difference vector
+  # z_A - z_hat_A as the |A| x SYM_LEN matrix D = diffs_active, with row a
+  # indexing active asymmetric feature combinations and column s the symmetric
+  # feature. By the vec trick, y = L^T (z_A - z_hat_A) viewed the same way is
+  #   Y = L_0^T D P_0 + L_1^T D P_1.
+  # P_1 = J/d averages each row, so (D P_1)[a, s] = delta_bar[a], and
+  # D P_0 = D - D P_1. Therefore, with k indexing the asymmetric row of y,
+  #   Y[k, s] = Σ_a L_0[a, k] D[a, s]
+  #           + Σ_a (L_1[a, k] - L_0[a, k]) delta_bar[a],
+  # where both sums run over a >= k because L_0, L_1 are lower triangular.
+  # The second sum (mean_term[k]) does not depend on s, so it is a single
+  # auxiliary variable shared by the SYM_LEN constraints defining y[k, :].
+  cholesky_matrix = prec.principal_submatrix(active_rows).cholesky()
+  l0, l1 = cholesky_matrix.coefficient_0, cholesky_matrix.coefficient_1
+  l_diff = l1 - l0
   objective_terms = []
-  for asym_part_1 in range(block_shape.asymmetric_length):
-    for asym_part_2 in range(asym_part_1 + 1):
-      # Generate coefficients for the objective terms corresponding to the
-      # current combination of values of the asymmetric features.
-      submatrix = compressed_precision_matrix[
-          2*asym_part_1:2*(asym_part_1+1),
-          2*asym_part_2:2*(asym_part_2+1)
-      ]
-      first_coefficient = sum(submatrix[0])
-      second_coefficient = sum(submatrix[1])
+  for k, row in enumerate(active_rows):
+    mean_term = model.add_variable(name=f'mean_term_{geocode}_{row}')
+    model.add_linear_constraint(
+        mean_term
+        == mathopt.fast_sum(
+            l_diff[a, k] * delta_bar[a] for a in range(k, num_active)
+        )
+    )
+    for s in range(SYM_LEN):
+      y_var = model.add_variable(name=f'y_{geocode}_{row * SYM_LEN + s}')
+      expr = (
+          mathopt.fast_sum(
+              l0[a, k] * diffs_active[a, s] for a in range(k, num_active)
+          )
+          + mean_term
+      )
+      model.add_linear_constraint(y_var == expr)
+      objective_terms.append(y_var * y_var)
 
-      # Double the off-diagonal coefficients, since the precision matrix is
-      # symmetric and we're only considering the lower triangular part.
-      if asym_part_1 != asym_part_2:
-        first_coefficient *= 2
-        second_coefficient *= 2
-
-      # First objective term is first row of submatrix, times dot product of
-      # subvectors of quadratic form inputs
-      # Can't use np.dot because it doesn't support mathopt.LinearExpression
-      inner_product_terms = [x * y for x, y in zip(differences[asym_part_1],
-                                                   differences[asym_part_2])]
-      if model is None:
-        inner_product = sum(inner_product_terms)
-      else:
-        inner_product = mathopt.fast_sum(inner_product_terms)
-      first_term = first_coefficient * inner_product
-      objective_terms.append(first_term)
-
-      # Second objective term is second row of submatrix, times product of sum
-      # of entries of subvectors of quadratic form inputs
-      sum_difference_1 = (partial_sum_variables[asym_part_1]
-                          - estimate_partial_sums[asym_part_1])
-      sum_difference_2 = (partial_sum_variables[asym_part_2]
-                          - estimate_partial_sums[asym_part_2])
-      second_term = second_coefficient * sum_difference_1 * sum_difference_2
-      objective_terms.append(second_term)
   return objective_terms
 
 
-def generate_total_only_objective_terms(
+def generate_succinct_total_only_objective_terms(
     model: mathopt.Model,
-    block_shape: block.BlockShape,
     geocode: str,
     est: estimate.Estimate,
     variables: Sequence[mathopt.Variable | float],
 ) -> Sequence[mathopt.QuadraticTypes]:
-  """Generate objective term for total-only optimization.
-
-  Uses compressed precision matrix to generate a single objective term
-  corresponding to the total query. The coefficient of this term is the inverse
-  of the variance of the total query.
+  """Generate objective term for total-only optimization using succinct representation.
 
   Args:
     model: The model to generate objective terms for.
-    block_shape: The BlockShape object describing the block structure.
     geocode: The geocode of the block, used for naming the sum dummy variable.
-    est: The estimate of the block.
+    est: The estimate of the block, whose covariance must be a
+      SuccinctCovariance.
     variables: The variables for the block.
 
   Returns:
-    A list containing either a single mathopt.QuadraticProduct or a float,
-    depending on whether the argument variables consists of mathopt.Variables
-    or floats.
-  """
-  if block_shape.num_features != block_shape.num_asymmetric_features +  1:
-    raise ValueError('Implementation of generate_total_only_objective_terms'
-                     'requires there to be a single symmetric feature.')
-  # Compute sum of entries of submatrix of covariance matrix that correspond
-  # to summing over the symmetric feature
-  variance_of_total = est.cov[1::2, 1::2].sum()
+    A list containing a single quadratic expression.
 
-  # Generate objective function term for block total only
-  # Use mathopt.fast_sum in the actual run when variables are mathopt.Variables,
-  # but for tests on floats, use sum()
-  if isinstance(variables[0], mathopt.Variable):
-    sum_variable = model.add_variable(lb=0, name=f'x_{geocode}_sum')
-    model.add_linear_constraint(
-        sum_variable == mathopt.fast_sum(variables))
-    linear_difference = sum_variable - sum(est.val)
-  else:
-    linear_difference = sum(variables) - sum(est.val)
+  Raises:
+    TypeError: If est.cov is not a SuccinctCovariance.
+  """
+  if not isinstance(est.cov, succinct.SuccinctCovariance):
+    raise TypeError('Expected SuccinctCovariance')
+
+  # Compute variance of the total count by summing over the all-ones vector:
+  # 1^T (C_0 \otimes P_0 + C_1 \otimes P_1) 1 = SYM_LEN * sum(C_1)
+  variance_of_total = SYM_LEN * est.cov.coefficient_1.sum()
+
+  sum_variable = model.add_variable(lb=0, name=f'x_{geocode}_sum')
+  model.add_linear_constraint(sum_variable == mathopt.fast_sum(variables))
+  linear_difference = sum_variable - sum(est.val)
   return [linear_difference * linear_difference / variance_of_total]
 
 
 def query_index_constrained_to_zero(
     index: int,
     first_feature_upper_bounds: Sequence[int],
-    query: tuple[int, ...],
+    query: tuple[int, ...] = DETAILED_SHAPE,
 ) -> bool:
   """Check if the index of a constrained feature in a query is zero."""
-  # if not split by housing type, can't be constrained
   if query[0] == 1:
     return False
-  # if split by housing type but not voting age, constraint determined by
-  # housing type alone
-  elif query[0] == 8 and query[1] == 1:
-    indices_per_housing_type = np.prod(query[2:])
-    return first_feature_upper_bounds[index // indices_per_housing_type] == 0  # pyrefly: ignore[bad-index]
-  # For detailed query, constraint determined by housing type and voting age
-  elif query == (8, 2, 2, 63):
-    return (index >= 756 and index < 882) or query_index_constrained_to_zero(
-        index // 252, first_feature_upper_bounds, (8, 1, 1, 1)
-    )
-  else:
+  if query[0] != DETAILED_SHAPE[0] or query[1] not in (1, DETAILED_SHAPE[1]):
     raise ValueError(f'Unsupported query shape {query}')
+
+  coords = tuple(map(int, np.unravel_index(index, query)))
+  if first_feature_upper_bounds[coords[0]] == 0:
+    return True
+  k = len(MULTIFEATURE_ZERO_SEQUENCE)
+  return (
+      query[:k] == DETAILED_SHAPE[:k]
+      and coords[:k] == MULTIFEATURE_ZERO_SEQUENCE
+  )
 
 
 def generate_rounder_detailed_query_objective_terms(
@@ -513,11 +436,11 @@ def generate_rounder_detailed_query_objective_terms(
   corresponds to whether the query is rounded up or down.
 
   Args:
-    values: the unrounded estimated value for each variable
-    floored_values: the floored estimated value for each variable
-    variables: the variables for the block
-    first_feature_upper_bounds: the upper bounds on the first feature for each
-      geocode
+    values: The unrounded estimated value for each variable.
+    floored_values: The floored estimated value for each variable.
+    variables: The variables for the block.
+    first_feature_upper_bounds: The upper bounds on the first feature for each
+      geocode.
 
   Returns:
     A list of mathopt Variables corresponding to the objective terms.
@@ -538,7 +461,6 @@ def generate_rounder_detailed_query_objective_terms(
 
 def generate_rounder_single_query_objective_terms(
     model: mathopt.Model,
-    block_shape: block.BlockShape,
     geocode: str,
     values: Sequence[float],
     floored_values: Sequence[float],
@@ -560,14 +482,13 @@ def generate_rounder_single_query_objective_terms(
 
   Args:
     model: The model to generate objective terms for.
-    block_shape: The BlockShape object describing the block structure.
     geocode: The geocode of the block, used for naming the dummy variables.
-    values: the unrounded estimated value for each variable
-    floored_values: the floored estimated value for each variable
-    variables: the variables for the block
-    first_feature_upper_bounds: the upper bounds on the first feature for each
-      geocode
-    query: the shape of the query
+    values: The unrounded estimated value for each variable.
+    floored_values: The floored estimated value for each variable.
+    variables: The variables for the block.
+    first_feature_upper_bounds: The upper bounds on the first feature for each
+      geocode.
+    query: The shape of the query.
 
   Returns:
     A list of mathopt Variables corresponding to the objective terms.
@@ -581,12 +502,11 @@ def generate_rounder_single_query_objective_terms(
     )
 
   aggregated_variables = mathopt_aggregate_to_query_shape(
-      block_shape=block_shape,
       values=variables,
       target_shape=query)
 
   diffs = np.asarray(values) - np.asarray(floored_values)
-  part_sum_diffs = aggregate_to_query_shape(diffs, query)
+  part_sum_diffs = query_encoding.project_to_query_shape(diffs, query)
 
   objective_terms = []
   for i, (diff, aggvar) in enumerate(zip(part_sum_diffs, aggregated_variables)):
@@ -602,7 +522,6 @@ def generate_rounder_single_query_objective_terms(
 
 def generate_rounder_full_objective_terms(
     model: mathopt.Model,
-    block_shape: block.BlockShape,
     geocode: str,
     values: Sequence[float],
     floored_values: Sequence[float],
@@ -614,15 +533,14 @@ def generate_rounder_full_objective_terms(
   Returns objective terms equal to the absolute difference between each rounded
   and unrounded value.
 
-  Arguments:
+  Args:
     model: The model to generate objective terms for.
-    block_shape: The BlockShape object describing the block structure.
     geocode: The geocode of the block, used for naming the dummy variables.
-    values: the unrounded estimated value for each variable
-    floored_values: the floored estimated value for each variable
-    variables: the variables for the block
-    first_feature_upper_bounds: the upper bounds on the first feature for each
-      geocode
+    values: The unrounded estimated value for each variable.
+    floored_values: The floored estimated value for each variable.
+    variables: The variables for the block.
+    first_feature_upper_bounds: The upper bounds on the first feature for each
+      geocode.
 
   Returns:
     A list of mathopt Variables corresponding to the objective terms.
@@ -636,7 +554,6 @@ def generate_rounder_full_objective_terms(
   for query in constants.CENSUS_ROUNDER_SECOND_PASS_QUERY_SHAPES:
     objective_terms.extend(generate_rounder_single_query_objective_terms(
         model=model,
-        block_shape=block_shape,
         geocode=geocode,
         values=values,
         floored_values=floored_values,
@@ -650,7 +567,6 @@ def generate_rounder_full_objective_terms(
 
 def generate_rounder_total_only_objective_terms(
     model: mathopt.Model,
-    block_shape: block.BlockShape,
     geocode: str,
     values: Sequence[float],
     floored_values: Sequence[float],
@@ -662,15 +578,14 @@ def generate_rounder_total_only_objective_terms(
   Returns a single objective term equal to the absolute difference between the
   rounded and unrounded total values.
 
-  Arguments:
+  Args:
     model: The model to generate objective terms for.
-    block_shape: The BlockShape object describing the block structure.
     geocode: The geocode of the block, used for naming the dummy variable.
-    values: the unrounded estimated value for each variable
-    floored_values: the floored estimated value for each variable
-    variables: the variables for the block
-    first_feature_upper_bounds: the upper bounds on the first feature for each
-      geocode
+    values: The unrounded estimated value for each variable.
+    floored_values: The floored estimated value for each variable.
+    variables: The variables for the block.
+    first_feature_upper_bounds: The upper bounds on the first feature for each
+      geocode.
 
   Returns:
     A list containing a single mathopt.Variable as the term to minimize.
@@ -682,7 +597,6 @@ def generate_rounder_total_only_objective_terms(
 
   return generate_rounder_single_query_objective_terms(
       model=model,
-      block_shape=block_shape,
       geocode=geocode,
       values=values,
       floored_values=floored_values,
@@ -692,103 +606,51 @@ def generate_rounder_total_only_objective_terms(
   )
 
 
-def aggregate_to_query_shape(
-    values: Sequence[float],
-    target_shape: tuple[int, ...],
-    initial_shape: tuple[int, ...] = constants.DETAILED_QUERY_SHAPE
-) -> Sequence[float]:
-  """Aggregate values to the shape of a query.
-
-  If the target shape is the census asymmetric query, then the grouped values
-  of the asymmetric feature are aggregated as well.
-
-  Args:
-    values: The values to aggregate.
-    target_shape: The shape to aggregate to.
-    initial_shape: The shape of the values before aggregation.
-
-  Returns:
-    A list of floats corresponding to the aggregated values.
-  """
-  effective_shape = (target_shape
-                     if target_shape != constants.CENSUS_ASYMMETRIC_QUERY_SHAPE
-                     else (8, 1, 1, 1))
-  values = (np.reshape(values, initial_shape)  # pyrefly: ignore[bad-assignment]
-            .sum(axis=tuple(np.flatnonzero(np.array(effective_shape) == 1)))
-            .reshape(-1))
-  if target_shape == constants.CENSUS_ASYMMETRIC_QUERY_SHAPE:
-    values = np.array([values[0],  # pyrefly: ignore[bad-assignment]
-                       values[1] + values[2] + values[3] + values[4],
-                       values[5] + values[6] + values[7]])
-  return values
-
-
 def mathopt_aggregate_to_query_shape(
-    block_shape: block.BlockShape,
-    values: Sequence[mathopt.Variable],
+    values: Sequence[mathopt.Variable | float],
     target_shape: tuple[int, ...],
-    initial_shape: tuple[int, ...] = constants.DETAILED_QUERY_SHAPE
-) -> Sequence[mathopt.Variable | mathopt.QuadraticTypes]:
+) -> Sequence[mathopt.QuadraticTypes]:
   """Use mathopt.fast_sum to aggregate values to the shape of a query.
 
-  The aggregation is performed by summing over the dimensions of the initial
-  shape that are not sliced in the target shape. If the target shape is an
-  asymmetric query, then the grouped values of the asymmetric feature are
-  aggregated as well.
-
   Args:
-    block_shape: The BlockShape object describing the block structure, used to
-      specify the structure of the asymmetric query
-    values: The values to aggregate.
-    target_shape: The shape to aggregate to.
-    initial_shape: The shape of the values before aggregation.
+    values: The values to aggregate, indexed by the detailed histogram.
+    target_shape: The shape of the query to aggregate to.
 
   Returns:
-    A list of objects corresponding to the aggregated values.
+    A list with one linear expression for each cell of the query.
   """
-  values = np.reshape(values, initial_shape)  # pyrefly: ignore[no-matching-overload]
-  for i in range(len(initial_shape) - 1, -1, -1):
-    if target_shape[i] == 1:
-      values = np.apply_along_axis(mathopt.fast_sum, i, values)  # pyrefly: ignore[no-matching-overload]
-  values = np.reshape(values, -1)  # pyrefly: ignore[no-matching-overload]
-
-  # If the target shape is an asymmetric query, aggregate the grouped values of
-  # the asymmetric feature for this query
-  if target_shape in block_shape.asymmetric_query_dict:
-    asym_query = block_shape.asymmetric_query_dict[target_shape]
-    # Aggregate the partial sums corresponding to the asymmetric query's
-    # partition of feature values for the sliced feature.
-    grouped_values = np.split(values, np.cumsum(asym_query.partition)[:-1])
-    values = [mathopt.fast_sum(x) for x in grouped_values]  # pyrefly: ignore[bad-assignment]
-  return values
+  value_array = np.asarray(values, dtype=object)
+  return [
+      mathopt.fast_sum(value_array[members])
+      for members in query_encoding.query_cell_members(target_shape)
+  ]
 
 
 def baseline_single_query_objective_term(
     model: mathopt.Model,
-    block_shape: block.BlockShape,
     geocode: str,
-    variables: Sequence[mathopt.Variable],
+    variables: Sequence[mathopt.Variable | float],
     query: tuple[int, ...],
-    estimate_value: Sequence[float],
+    estimate_value: Sequence[float] | np.ndarray,
     estimate_variance: float,
 ) -> Sequence[mathopt.QuadraticTypes]:
   """Generate objective term for a single query for baseline L2 optimization.
 
   A single query is a tuple of integers corresponding to the dimensions of the
   query, corresponding to a partial rollup of some of the features. (For any
-  asymmetric queries defined in block_shape, some values of a particular feature
-  may be grouped together.) The objective term is the sum of the squared
-  differences between the estimate values and the partial sums of the variables
-  corresponding to the rollup for that query.
+  asymmetric queries, some values of a particular feature may be grouped
+  together.) The objective term is the sum of the squared differences between
+  the estimate values and the partial sums of the variables corresponding to the
+  rollup for that query.
 
   Args:
     model: The model the objective term will be added to, used for defining
       partial sum variables.
-    block_shape: The BlockShape object describing the block structure.
-    geocode: The geocode of the block, used for naming the partial sum variables
+    geocode: The geocode of the block, used for naming the partial sum
+      variables.
     variables: The variables for the block.
     query: The shape of the query.
-    estimate_value: The estimates value of the query.
+    estimate_value: The estimate values of the query.
     estimate_variance: The variance of the estimate.
 
   Returns:
@@ -798,106 +660,24 @@ def baseline_single_query_objective_term(
   if query == constants.DETAILED_QUERY_SHAPE:
     partial_sum_variables = variables
   else:
-    variables = mathopt_aggregate_to_query_shape(block_shape, variables, query)  # pyrefly: ignore[bad-assignment]
+    agg_vars = mathopt_aggregate_to_query_shape(variables, query)
     partial_sum_variables = [
         model.add_variable(lb=0, name=f'x_{geocode}_{query}_partial_sum_{i}')
-        for i in range(len(variables))
+        for i in range(len(agg_vars))
     ]
-    for x, y in zip(variables, partial_sum_variables):
+    for x, y in zip(agg_vars, partial_sum_variables):
       model.add_linear_constraint(x == y)
 
   return [(x - y) * (x - y) / estimate_variance
           for x, y in zip(partial_sum_variables, estimate_value)]
 
 
-def generate_objective_terms(
-    objective_function_type: constants.ObjectiveFunctionType,
-    model: mathopt.Model,
-    block_shape: block.BlockShape,
-    geocode: str,
-    est: estimate.Estimate,
-    variables: Sequence[mathopt.Variable | float],
-    floored_values: np.ndarray | None = None,
-    first_feature_upper_bounds: Sequence[int] | None = None,
-    constrained_total: bool = False,
-) -> Sequence[mathopt.QuadraticTypes]:
-  """Wrapper to generate objective terms for the model.
-
-  This function calls the appropriate function to generate objective terms
-  depending on the value of the objective function type. It can either generate
-  an objective function term for the full optimization problem or an objective
-  function term for the total-only optimization problem.
-
-  Args:
-    objective_function_type: The type of objective function to generate.
-    model: The model to generate objective terms for.
-    block_shape: The BlockShape object describing the block structure.
-    geocode: The geocode of the block.
-    est: The estimate of the block.
-    variables: The variables for the block.
-    floored_values: The floored values for the block, if this is a rounder pass.
-      This argument could be removed but avoids recomputing the floored values.
-    first_feature_upper_bounds: The upper bounds for the first feature of each
-      type.
-    constrained_total: Whether the total pass values are constrained in the
-      input estimate.
-
-  Returns:
-    A list of quadratic expressions or floats, depending on whether a model is
-    provided.
-  """
-  match objective_function_type:
-    case constants.ObjectiveFunctionType.FULL:
-      return generate_full_objective_terms(
-          model=model,
-          block_shape=block_shape,
-          geocode=geocode,
-          est=est,
-          variables=variables,
-          first_feature_upper_bounds=first_feature_upper_bounds,  # pyrefly: ignore[bad-argument-type]
-          constrained_total=constrained_total,
-      )
-    case constants.ObjectiveFunctionType.TOTAL_ONLY:
-      return generate_total_only_objective_terms(
-          model=model,
-          block_shape=block_shape,
-          geocode=geocode,
-          est=est,
-          variables=variables,
-      )
-    case constants.ObjectiveFunctionType.FULL_ROUNDER:
-      return generate_rounder_full_objective_terms(
-          model=model,
-          block_shape=block_shape,
-          geocode=geocode,
-          values=est.val,  # pyrefly: ignore[bad-argument-type]
-          floored_values=floored_values,  # pyrefly: ignore[bad-argument-type]
-          variables=variables,  # pyrefly: ignore[bad-argument-type]
-          first_feature_upper_bounds=first_feature_upper_bounds,  # pyrefly: ignore[bad-argument-type]
-      )
-    case constants.ObjectiveFunctionType.TOTAL_ONLY_ROUNDER:
-      return generate_rounder_total_only_objective_terms(
-          model=model,
-          block_shape=block_shape,
-          geocode=geocode,
-          values=est.val,  # pyrefly: ignore[bad-argument-type]
-          floored_values=floored_values,  # pyrefly: ignore[bad-argument-type]
-          variables=variables,  # pyrefly: ignore[bad-argument-type]
-          first_feature_upper_bounds=first_feature_upper_bounds,  # pyrefly: ignore[bad-argument-type]
-      )
-    case _:
-      raise ValueError(
-          f'Unsupported objective function type: {objective_function_type}'
-      )
-
-
 def baseline_objective_terms(
     objective_function_type: constants.ObjectiveFunctionType,
     model: mathopt.Model,
-    block_shape: block.BlockShape,
     geocode: str,
     est_dict: dict[tuple[int, ...], tuple[np.ndarray, float]],
-    variables: Sequence[mathopt.Variable],
+    variables: Sequence[mathopt.Variable | float],
 ) -> Sequence[mathopt.QuadraticTypes]:
   """Wrapper to generate objective terms for the baseline L2 optimization.
 
@@ -909,9 +689,8 @@ def baseline_objective_terms(
   Args:
     objective_function_type: The type of objective function to generate.
     model: The model to generate objective terms for.
-    block_shape: The BlockShape object describing the block structure.
     geocode: The geocode of the block.
-    est_dict: a dictionary mapping query shapes to tuples. The first element of
+    est_dict: A dictionary mapping query shapes to tuples. The first element of
       the tuple consists of the estimate values for the query. The second
       element of the tuple consists of the variance of the estimate.
     variables: The variables for the block.
@@ -924,25 +703,25 @@ def baseline_objective_terms(
     case constants.ObjectiveFunctionType.FULL:
       objective_terms = []
       for query in est_dict:
-        objective_terms.extend(baseline_single_query_objective_term(
-            model=model,
-            block_shape=block_shape,
-            geocode=geocode,
-            variables=variables,
-            query=query,
-            estimate_value=est_dict[query][0],  # pyrefly: ignore[bad-argument-type]
-            estimate_variance=est_dict[query][1],
-        ))
+        objective_terms.extend(
+            baseline_single_query_objective_term(
+                model=model,
+                geocode=geocode,
+                variables=variables,
+                query=query,
+                estimate_value=est_dict[query][0],
+                estimate_variance=est_dict[query][1],
+            )
+        )
       return objective_terms
     case constants.ObjectiveFunctionType.TOTAL_ONLY:
       total_shape = constants.TOTAL_QUERY_SHAPE
       return baseline_single_query_objective_term(
           model=model,
-          block_shape=block_shape,
           geocode=geocode,
           variables=variables,
           query=total_shape,
-          estimate_value=est_dict[total_shape][0],  # pyrefly: ignore[bad-argument-type]
+          estimate_value=est_dict[total_shape][0],
           estimate_variance=est_dict[total_shape][1],
       )
     case _:
@@ -951,8 +730,82 @@ def baseline_objective_terms(
       )
 
 
+def generate_objective_terms(
+    objective_function_type: constants.ObjectiveFunctionType,
+    model: mathopt.Model,
+    geocode: str,
+    est: estimate.Estimate,
+    variables: Sequence[mathopt.Variable | float],
+    cons: succinct.SuccinctConstraint,
+    floored_values: np.ndarray | None = None,
+    first_feature_upper_bounds: Sequence[int] | None = None,
+    alpha: float = ALPHA_VALUES[0],
+) -> Sequence[mathopt.QuadraticTypes]:
+  """Wrapper to generate objective terms for the model.
+
+  This function calls the appropriate function to generate objective terms
+  depending on the value of the objective function type. It can either generate
+  an objective function term for the full optimization problem or an objective
+  function term for the total-only optimization problem.
+
+  Args:
+    objective_function_type: The type of objective function to generate.
+    model: The model to generate objective terms for.
+    geocode: The geocode of the block.
+    est: The estimate of the block.
+    variables: The variables for the block.
+    cons: The local SuccinctConstraint for the block.
+    floored_values: The floored values for the block, if this is a rounder pass.
+      This argument could be removed but avoids recomputing the floored values.
+    first_feature_upper_bounds: The upper bounds for the first feature of each
+      type.
+    alpha: Conditioning parameter for the local constraints in the full pass.
+
+  Returns:
+    A list of quadratic expressions.
+  """
+  match objective_function_type:
+    case constants.ObjectiveFunctionType.FULL:
+      return generate_succinct_full_objective_terms(
+          model=model,
+          geocode=geocode,
+          est=est,
+          variables=variables,
+          cons=cons,
+          alpha=alpha,
+      )
+    case constants.ObjectiveFunctionType.TOTAL_ONLY:
+      return generate_succinct_total_only_objective_terms(
+          model=model,
+          geocode=geocode,
+          est=est,
+          variables=variables,
+      )
+    case constants.ObjectiveFunctionType.FULL_ROUNDER:
+      return generate_rounder_full_objective_terms(
+          model=model,
+          geocode=geocode,
+          values=est.val,  # pyrefly: ignore[bad-argument-type]
+          floored_values=floored_values,  # pyrefly: ignore[bad-argument-type]
+          variables=variables,  # pyrefly: ignore[bad-argument-type]
+          first_feature_upper_bounds=first_feature_upper_bounds,  # pyrefly: ignore[bad-argument-type]
+      )
+    case constants.ObjectiveFunctionType.TOTAL_ONLY_ROUNDER:
+      return generate_rounder_total_only_objective_terms(
+          model=model,
+          geocode=geocode,
+          values=est.val,  # pyrefly: ignore[bad-argument-type]
+          floored_values=floored_values,  # pyrefly: ignore[bad-argument-type]
+          variables=variables,  # pyrefly: ignore[bad-argument-type]
+          first_feature_upper_bounds=first_feature_upper_bounds,  # pyrefly: ignore[bad-argument-type]
+      )
+    case _:
+      raise ValueError(
+          f'Unsupported objective function type: {objective_function_type}'
+      )
+
+
 def index_constrained_to_zero(
-    block_shape: block.BlockShape,
     variable_index: int,
     first_feature_upper_bounds: Sequence[int],
 ) -> bool:
@@ -968,33 +821,19 @@ def index_constrained_to_zero(
   zero. This corresponds to the index range [756, 882).
 
   Args:
-    block_shape: The BlockShape object describing the block structure.
     variable_index: The index of the variable.
     first_feature_upper_bounds: The upper bounds for each first feature type.
 
   Returns:
     True if the variable should be constrained to zero, False otherwise.
   """
-  # Check first feature upper bound
-  first_feature_value = variable_index // (block_shape.length //
-                                           block_shape.shape[0])
-  if first_feature_upper_bounds[first_feature_value] == 0:
-    return True
-
-  # Check multifeature zero constraint
-  values_per_combination = block_shape.length
-  first_value = 0
-
-  for i, feature_value in enumerate(MULTIFEATURE_ZERO_SEQUENCE):
-    values_per_combination //= block_shape.shape[i]
-    first_value += values_per_combination * feature_value
-
-  return first_value <= variable_index < first_value + values_per_combination
+  return query_index_constrained_to_zero(
+      variable_index, first_feature_upper_bounds, DETAILED_SHAPE
+  )
 
 
 def add_variable(
     model: mathopt.Model,
-    block_shape: block.BlockShape,
     objective_function_type: constants.ObjectiveFunctionType,
     upper_bound: int,
     first_feature_upper_bounds: Sequence[int],
@@ -1003,12 +842,12 @@ def add_variable(
 ) -> mathopt.Variable | float:
   """Add a variable to the model.
 
-  The variable can be either a non-negative float or a {0,1}-valued integer
+  If the variable is constrained to zero, returns 0.0 instead of adding a
+  variable to the model. Otherwise, adds either a float or {0, 1}-valued integer
   variable, depending on the objective function type.
 
   Args:
     model: The model to add the variable to.
-    block_shape: The BlockShape object describing the block structure.
     objective_function_type: The type of objective function used for the model,
       which determines whether variables are floats or {0, 1}-valued integers.
     upper_bound: The upper bound of the variable, ignored for integer variables.
@@ -1019,20 +858,17 @@ def add_variable(
     variable_index: The index of the variable, used for naming the variable.
 
   Returns:
-    A mathopt.Variable corresponding to the variable added to the model.
-
-  Raises:
-    ValueError: If the objective function is neither L2 nor rounder pass.
+    A mathopt.Variable corresponding to the variable added to the model, or 0.0
+    if the variable is constrained to zero.
   """
   if index_constrained_to_zero(
-      block_shape=block_shape,
       variable_index=variable_index,
       first_feature_upper_bounds=first_feature_upper_bounds):
     return 0.0
 
   if objective_function_type in constants.ROUNDER_PASSES:
     # Use integer variables for the rounder pass.
-
+    #
     # As an alternative to using {0, 1}-valued variables with an offset, we
     # could use {offset, offset + 1}-valued variables with no offset. This
     # would make it simpler to apply the constraints, but it is unclear how
@@ -1048,9 +884,8 @@ def add_variable(
 
 def add_variables(
     model: mathopt.Model,
-    block_shape: block.BlockShape,
     objective_function_type: constants.ObjectiveFunctionType,
-    upper_bounds: int | Sequence[int],
+    upper_bounds: int | Sequence[int] | np.ndarray,
     first_feature_upper_bounds: Sequence[int],
     geocode: str,
     num_variables: int,
@@ -1061,9 +896,8 @@ def add_variables(
   return [
       add_variable(
           model=model,
-          block_shape=block_shape,
           objective_function_type=objective_function_type,
-          upper_bound=upper_bounds[i],
+          upper_bound=int(upper_bounds[i]),
           first_feature_upper_bounds=first_feature_upper_bounds,
           geocode=geocode,
           variable_index=i,
@@ -1074,30 +908,28 @@ def add_variables(
 
 def generate_and_constrain_node_variables(
     model: mathopt.Model,
-    block_shape: block.BlockShape,
     objective_function_type: constants.ObjectiveFunctionType,
     num_variables: int,
-    type_upper_bounds: Sequence[int],
+    type_upper_bounds: Sequence[int] | np.ndarray,
     first_feature_upper_bounds: Sequence[int],
     first_feature_lower_bounds: Sequence[int],
     offsets: None | np.ndarray,
     geocode: str,
-    total_pass_values: None | dict[str, Sequence[float]],
+    total_pass_values: None | Mapping[str, Sequence[float] | np.ndarray],
 ) -> Sequence[mathopt.Variable | float]:
   """Add (child) node variables to the model and add constraints to them.
 
   The constraints added to the node are as follows:
   1. The first feature upper and lower bound constraints are respected.
   2. The multifeature zero sequence constraints are added if not redundant. That
-      is, if the upper bound for housing type 3 was zero, then these variables
-      have already been constrained to zero; otherwise, they will be constrained
-      to zero anyway.
+     is, if the upper bound for housing type 3 was zero, then these variables
+     have already been constrained to zero; otherwise, they will be constrained
+     to zero anyway.
   3. If total pass values are provided, then the sum of the variables for the
-      node must equal the sum of the total pass values for the node.
+     node must equal the sum of the total pass values for the node.
 
   Args:
     model: The model to add the variables and constraints to.
-    block_shape: The BlockShape object describing the block structure.
     objective_function_type: The type of objective function used for the model,
       which determines whether variables are floats or {0, 1}-valued integers.
     num_variables: The number of types / variables per node.
@@ -1111,10 +943,10 @@ def generate_and_constrain_node_variables(
       indexing into total_pass_values.
     total_pass_values: A dictionary mapping (child) geocodes to a list of floats
       corresponding to the count for each type for that node. If provided, then
-      the sum of the variables for the node must equal the sum of the total
-      pass values for that node. If a single integer is provided as the
-      dictionary value instead of a list, then that value is assumed to be the
-      sum of the total pass values for all types for that node.
+      the sum of the variables for the node must equal the sum of the total pass
+      values for that node. If a single integer is provided as the dictionary
+      value instead of a list, then that value is assumed to be the sum of the
+      total pass values for all types for that node.
 
   Returns:
     A list of variables added to the model, corresponding to the count for each
@@ -1122,7 +954,6 @@ def generate_and_constrain_node_variables(
   """
   row_variables = add_variables(
       model=model,
-      block_shape=block_shape,
       objective_function_type=objective_function_type,
       upper_bounds=type_upper_bounds,
       first_feature_upper_bounds=first_feature_upper_bounds,
@@ -1131,7 +962,6 @@ def generate_and_constrain_node_variables(
   )
 
   add_feature_constraints(
-      block_shape=block_shape,
       model=model,
       variables=row_variables,  # pyrefly: ignore[bad-argument-type]
       lower_bounds=first_feature_lower_bounds,
@@ -1139,9 +969,7 @@ def generate_and_constrain_node_variables(
       offsets=offsets,  # pyrefly: ignore[bad-argument-type]
   )
   if total_pass_values is not None and geocode in total_pass_values:
-    offset_sum = 0
-    if offsets is not None and not geocode:
-      offset_sum = sum(offsets)
+    offset_sum = 0 if offsets is None else sum(offsets)
     model.add_linear_constraint(
         mathopt.fast_sum(row_variables)
         == float(sum(total_pass_values[geocode]) - offset_sum)
@@ -1195,7 +1023,6 @@ def add_subtree_total_constraints(
 
 
 def run_node_optimization(
-    block_shape: block.BlockShape,
     objective_function_type: constants.ObjectiveFunctionType,
     parent_geocode: str,
     child_geocodes: Sequence[str],
@@ -1203,24 +1030,29 @@ def run_node_optimization(
     child_ests: dict[str, estimate.Estimate],
     children_upper_bound_dict: dict[str, Sequence[int]],
     children_lower_bound_dict: dict[str, Sequence[int]],
-    total_pass_values: None | dict[str, Sequence[float]] = None,
+    total_pass_values: None | Mapping[str, Sequence[float] | np.ndarray] = None,
     subtree_total_dict: None | dict[str, int] = None,
+    solve_parameters: mathopt.SolveParameters | None = None,
+    alpha_values: Sequence[float] = ALPHA_VALUES,
 ) -> tuple[dict[str, Sequence[mathopt.Variable | float]], mathopt.SolveResult]:
   """Solve optimization problem for block hierarchical postprocessing.
 
   Initializes a model and adds variables and constraints to it. Computes
   the objective function determined by the parameter objective_function_type.
-  Solves the model and returns the variables and the solve result.
+  Solves the model and returns the variables and the solve result. If solving
+  fails to find an optimal solution for the FULL pass, retries immediately over
+  the sequence of candidate alpha values in `alpha_values`. If all alpha values
+  fail (e.g. due to barrier imprecision), retries the last model with dual
+  simplex as a final fallback.
 
   The constraints added are as follows:
   Constraints (1-3) as described in the documentation for
   generate_and_constrain_node_variables are added for each child node.
   The following additional constraint is added:
   4. The sum of the variables for each type across all children equals the
-      parent value for that type.
+     parent value for that type.
 
   Args:
-    block_shape: The BlockShape object describing the block structure.
     objective_function_type: The type of objective function to optimize.
     parent_geocode: The geocode of the parent node.
     child_geocodes: The geocodes of the child nodes.
@@ -1229,7 +1061,7 @@ def run_node_optimization(
     children_upper_bound_dict: A dictionary mapping child geocodes to upper
       bounds for each first feature type.
     children_lower_bound_dict: A dictionary mapping child geocodes to lower
-      bounds for each first featuretype.
+      bounds for each first feature type.
     total_pass_values: A dictionary mapping child geocodes to a list of floats
       corresponding to the count for each type for that child. If provided, then
       the sum of the variables for each child produced in this pass must equal
@@ -1237,12 +1069,22 @@ def run_node_optimization(
     subtree_total_dict: A dictionary mapping state-level geocodes to totals. If
       provided, then the sum of the variables for the AIAN and non-AIAN subtrees
       for that state must equal the total.
+    solve_parameters: Optional SolveParameters to pass to the solver.
+    alpha_values: Sequence of candidate alpha conditioning parameters to try
+      when optimizing the FULL pass.
 
   Returns:
     A tuple containing a dictionary and the solve result. The dictionary maps
     child geocodes to a list of variables corresponding to the count for each
     type for that child.
+
+  Raises:
+    ValueError: If `alpha_values` is empty.
+    RuntimeError: If optimization fails for all candidate alpha values.
   """
+  if not alpha_values:
+    raise ValueError('alpha_values must be non-empty.')
+
   logging.info(
       'Performing %s optimization for parent node \'%s\' with %d children.',
       objective_function_type.name,
@@ -1250,87 +1092,137 @@ def run_node_optimization(
       len(child_geocodes),
   )
 
-  model = mathopt.Model(name=f'{parent_geocode}')
-  objective_terms = []
-
-  model_variables = {}
-  offset_sum_dict = None
-  floored_child_est_sum = (
-      np.zeros(block_shape.length)
-      if objective_function_type in constants.ROUNDER_PASSES
-      else None
+  candidate_alphas = (
+      alpha_values
+      if objective_function_type == constants.ObjectiveFunctionType.FULL
+      else (alpha_values[0],)
   )
 
-  # Add variables, constraints and objective terms for each child node.
-  for geocode in child_geocodes:
-    child_est = child_ests[geocode]
-    floored_child_est = None
-    if objective_function_type in constants.ROUNDER_PASSES:
-      floored_child_est = np.floor(child_est.val).astype(int)
-      floored_child_est_sum += floored_child_est
-      if offset_sum_dict is None:
-        offset_sum_dict = {}
-      offset_sum_dict[geocode] = sum(floored_child_est)
+  failures = []
+  last_error = None
 
-    row_variables = generate_and_constrain_node_variables(
-        model=model,
-        block_shape=block_shape,
-        objective_function_type=objective_function_type,
-        num_variables=len(child_est.val),
-        type_upper_bounds=parent_val,
-        first_feature_upper_bounds=children_upper_bound_dict[geocode],
-        first_feature_lower_bounds=children_lower_bound_dict[geocode],
-        offsets=floored_child_est,
-        geocode=geocode,
-        total_pass_values=total_pass_values,
+  for alpha in candidate_alphas:
+    model = mathopt.Model(name=f'{parent_geocode}')
+    objective_terms = []
+
+    model_variables = {}
+    offset_sum_dict = None
+    floored_child_est_sum = (
+        np.zeros(TOTAL_LEN)
+        if objective_function_type in constants.ROUNDER_PASSES
+        else None
     )
 
-    objective_terms.extend(generate_objective_terms(
-        objective_function_type=objective_function_type,
-        model=model,
-        block_shape=block_shape,
-        geocode=geocode,
-        est=child_est,
-        variables=row_variables,
-        floored_values=floored_child_est,
-        first_feature_upper_bounds=children_upper_bound_dict[geocode],
-        constrained_total=False  # Total has only been constrained in bottom-up
-                                 # pass for the root node; for statewide total
-                                 # constraints, the per-state constraint is
-                                 # added during bottom-up root processing.
-    ))
-    model_variables[geocode] = row_variables
+    # Add variables, constraints and objective terms for each child node.
+    for geocode in child_geocodes:
+      child_est = child_ests[geocode]
+      floored_child_est = None
+      if objective_function_type in constants.ROUNDER_PASSES:
+        floored_child_est = np.floor(child_est.val).astype(int)
+        floored_child_est_sum += floored_child_est
+        if offset_sum_dict is None:
+          offset_sum_dict = {}
+        offset_sum_dict[geocode] = sum(floored_child_est)
 
-  logging.info('Adding parent sum constraints')
-  add_parent_sum_constraints(
-      model=model,
-      model_variables=model_variables,
-      parent_val=parent_val,
-      child_sum_offsets=floored_child_est_sum,  # pyrefly: ignore[bad-argument-type]
-  )
+      row_variables = generate_and_constrain_node_variables(
+          model=model,
+          objective_function_type=objective_function_type,
+          num_variables=len(child_est.val),
+          type_upper_bounds=parent_val,
+          first_feature_upper_bounds=children_upper_bound_dict[geocode],
+          first_feature_lower_bounds=children_lower_bound_dict[geocode],
+          offsets=floored_child_est,
+          geocode=geocode,
+          total_pass_values=total_pass_values,
+      )
 
-  if subtree_total_dict is not None:
-    logging.info('Adding subtree total constraints')
-    add_subtree_total_constraints(
+      # Construct local constraints R_v for the child.
+      child_cons = succinct.SuccinctConstraint.zero_constraints(
+          first_feature_zero_indices=[
+              y == 0 for y in children_upper_bound_dict[geocode]
+          ],
+          multifeature_zero_sequence=MULTIFEATURE_ZERO_SEQUENCE,
+      )
+
+      objective_terms.extend(
+          generate_objective_terms(
+              objective_function_type=objective_function_type,
+              model=model,
+              geocode=geocode,
+              est=child_est,
+              variables=row_variables,
+              cons=child_cons,
+              floored_values=floored_child_est,
+              first_feature_upper_bounds=children_upper_bound_dict[geocode],
+              alpha=alpha,
+          )
+      )
+      model_variables[geocode] = row_variables
+
+    logging.info('Adding parent sum constraints')
+    add_parent_sum_constraints(
         model=model,
         model_variables=model_variables,
-        subtree_total_dict=subtree_total_dict,  # pyrefly: ignore[bad-argument-type]
-        offset_sum_dict=offset_sum_dict,
+        parent_val=parent_val,
+        child_sum_offsets=floored_child_est_sum,  # pyrefly: ignore[bad-argument-type]
     )
 
-  logging.info('Minimizing objective function (%d terms)', len(objective_terms))
-  model.minimize(0)
-  for i, term in enumerate(objective_terms):
-    if i % 5000 == 0:
-      logging.info('Adding term %d', i)
-    model.objective.add(term)
-  result = do_solve(model)
+    if subtree_total_dict is not None:
+      logging.info('Adding subtree total constraints')
+      add_subtree_total_constraints(
+          model=model,
+          model_variables=model_variables,
+          subtree_total_dict=subtree_total_dict,  # pyrefly: ignore[bad-argument-type]
+          offset_sum_dict=offset_sum_dict,
+      )
 
-  return model_variables, result
+    logging.info(
+        'Minimizing objective function (%d terms)', len(objective_terms)
+    )
+    model.minimize(mathopt.fast_sum(objective_terms))
+
+    try:
+      result = do_solve(model, solve_parameters=solve_parameters)
+      return model_variables, result
+    except RuntimeError as err:
+      last_error = err
+      failures.append(f'alpha={alpha}: {err}')
+      logging.warning(
+          "Optimization failed for parent node '%s' (%s) with alpha=%s: %s",
+          parent_geocode,
+          objective_function_type.name,
+          alpha,
+          err,
+      )
+
+  # All alpha values exhausted with barrier; retry the last model with dual
+  # simplex.
+  if SOLVER == constants.SolverType.GUROBI:
+    logging.warning(
+        'All alpha values exhausted for parent node %r (%s). '
+        'Retrying last model with dual simplex.',
+        parent_geocode,
+        objective_function_type.name,
+    )
+    try:
+      result = do_solve(
+          model,  # pyrefly: ignore[unbound-name]
+          use_simplex=True,
+      )
+      logging.info('Dual simplex retry succeeded.')
+      return model_variables, result  # pyrefly: ignore[unbound-name]
+    except RuntimeError as err:
+      last_error = err
+      failures.append(f'simplex retry: {err}')
+
+  raise RuntimeError(
+      f'Optimization failed for parent node {parent_geocode!r} '
+      f'({objective_function_type.name}) across all alpha values '
+      f'{list(candidate_alphas)}: {"; ".join(failures)}'
+  ) from last_error
 
 
 def run_baseline_node_optimization(
-    block_shape: block.BlockShape,
     objective_function_type: constants.ObjectiveFunctionType,
     parent_geocode: str,
     child_geocodes: Sequence[str],
@@ -1338,8 +1230,9 @@ def run_baseline_node_optimization(
     child_ests: dict[str, dict[tuple[int, ...], tuple[np.ndarray, float]]],
     children_upper_bound_dict: dict[str, Sequence[int]],
     children_lower_bound_dict: dict[str, Sequence[int]],
-    total_pass_values: None | dict[str, Sequence[float]] = None,
+    total_pass_values: None | Mapping[str, Sequence[float] | np.ndarray] = None,
     subtree_total_dict: None | dict[str, float] = None,
+    solve_parameters: mathopt.SolveParameters | None = None,
 ) -> tuple[dict[str, Sequence[mathopt.Variable | float]], mathopt.SolveResult]:
   """Solve baseline optimization problem for block hierarchical postprocessing.
 
@@ -1352,10 +1245,9 @@ def run_baseline_node_optimization(
   generate_and_constrain_node_variables are added for each child node.
   The following additional constraint is added:
   4. The sum of the variables for each type across all children equals the
-      parent value for that type.
+     parent value for that type.
 
   Args:
-    block_shape: The BlockShape object describing the block structure.
     objective_function_type: The type of objective function to optimize.
     parent_geocode: The geocode of the parent node.
     child_geocodes: The geocodes of the child nodes.
@@ -1375,6 +1267,7 @@ def run_baseline_node_optimization(
     subtree_total_dict: A dictionary mapping state-level geocodes to totals. If
       provided, then the sum of the variables for the AIAN and non-AIAN subtrees
       for that state must equal the total.
+    solve_parameters: Optional SolveParameters to pass to the solver.
 
   Returns:
     A tuple containing a dictionary and the solve result. The dictionary maps
@@ -1403,7 +1296,6 @@ def run_baseline_node_optimization(
 
     row_variables = generate_and_constrain_node_variables(
         model=model,
-        block_shape=block_shape,
         objective_function_type=objective_function_type,
         num_variables=len(child_est_dict[constants.DETAILED_QUERY_SHAPE][0]),
         type_upper_bounds=parent_val,
@@ -1414,14 +1306,15 @@ def run_baseline_node_optimization(
         total_pass_values=total_pass_values
     )
 
-    objective_terms.extend(baseline_objective_terms(
-        objective_function_type=objective_function_type,
-        model=model,
-        block_shape=block_shape,
-        geocode=geocode,
-        est_dict=child_est_dict,
-        variables=row_variables,  # pyrefly: ignore[bad-argument-type]
-    ))
+    objective_terms.extend(
+        baseline_objective_terms(
+            objective_function_type=objective_function_type,
+            model=model,
+            geocode=geocode,
+            est_dict=child_est_dict,
+            variables=row_variables,  # pyrefly: ignore[bad-argument-type]
+        )
+    )
     model_variables[geocode] = row_variables
 
   add_parent_sum_constraints(
@@ -1440,12 +1333,11 @@ def run_baseline_node_optimization(
     )
 
   model.minimize(mathopt.fast_sum(objective_terms))
-  result = do_solve(model)
+  result = do_solve(model, solve_parameters=solve_parameters)
   return model_variables, result
 
 
 def run_node_optimization_passes(
-    block_shape: block.BlockShape,
     objective_function_types: Sequence[constants.ObjectiveFunctionType],
     parent_geocode: str,
     child_geocodes: Sequence[str],
@@ -1453,14 +1345,14 @@ def run_node_optimization_passes(
     child_ests: dict[str, estimate.Estimate],
     children_upper_bound_dict: dict[str, Sequence[int]],
     children_lower_bound_dict: dict[str, Sequence[int]],
-    subtree_total_dict: None | dict[str, int] = None
+    subtree_total_dict: None | dict[str, int] = None,
+    solve_parameters: mathopt.SolveParameters | None = None,
 ) -> dict[str, Sequence[int]]:
   """Run optimization passes for block hierarchical postprocessing.
 
   Args:
-    block_shape: The BlockShape object describing the block structure.
-    objective_function_types: The list of objective function types to run.
-      Must contain at least one L2 pass and one rounder pass.
+    objective_function_types: The list of objective function types to run. Must
+      contain at least one L2 pass and one rounder pass.
     parent_geocode: The geocode of the parent node.
     child_geocodes: The geocodes of the child nodes.
     parent_val: The parent value for each type.
@@ -1472,6 +1364,7 @@ def run_node_optimization_passes(
     subtree_total_dict: A dictionary mapping state-level geocodes to totals. If
       provided, then the sum of the variables for the AIAN and non-AIAN subtrees
       for that state must equal the total.
+    solve_parameters: Optional SolveParameters to pass to the solver.
 
   Returns:
     A dictionary mapping child geocodes to estimates of child nodes.
@@ -1485,19 +1378,21 @@ def run_node_optimization_passes(
   for objective_function_type in objective_function_types:
     logging.info('Running pass %s', objective_function_type.name)
 
-    # If this is a rounder pass, retrieve the child estimates from previous pass
+    # If this is a rounder pass, retrieve the child estimates from previous
+    # pass.
     if objective_function_type in constants.ROUNDER_PASSES:
       if l2_pass_ests is None:
         raise ValueError('Cannot run rounder pass without previous L2 pass')
       child_ests = {
           geocode: estimate.Estimate(
               val=l2_pass_ests[geocode],  # pyrefly: ignore[bad-argument-type]
-              cov=np.array(0))
+              # dummy cov, not used in rounder
+              cov=succinct.SuccinctCovariance.identity(),
+          )
           for geocode in child_geocodes
       }
 
     model_variables, result = run_node_optimization(
-        block_shape=block_shape,
         objective_function_type=objective_function_type,
         parent_geocode=parent_geocode,
         child_geocodes=child_geocodes,
@@ -1507,45 +1402,40 @@ def run_node_optimization_passes(
         children_lower_bound_dict=children_lower_bound_dict,
         total_pass_values=total_pass_values,
         subtree_total_dict=subtree_total_dict,
+        solve_parameters=solve_parameters,
     )
 
-    # Set total_pass_values if we have just completed a total pass.
-    if objective_function_type in constants.TOTAL_ONLY_PASSES:
-      if objective_function_type in constants.L2_PASSES:
-        total_pass_values = {
-            geocode: variable_values(result, ests)
-            for geocode, ests in model_variables.items()
-        }
-      else:  # objective_function_type in constants.ROUNDER_PASSES:
-        total_pass_values = {
-            geocode: integer_variable_values(result, ests)
-            for geocode, ests in model_variables.items()
-        }
-    else:
-      total_pass_values = None
-
-    # Update last pass estimates.
+    # Update last pass estimates and set total_pass_values if we have just
+    # completed a total pass.
     if objective_function_type in constants.L2_PASSES:
-      l2_pass_ests = {x: variable_values(result, model_variables[x])
-                      for x in child_geocodes}
+      l2_pass_ests = {
+          x: variable_values(result, model_variables[x]) for x in child_geocodes
+      }
+      total_pass_values = (
+          l2_pass_ests
+          if objective_function_type in constants.TOTAL_ONLY_PASSES
+          else None
+      )
     elif objective_function_type in constants.ROUNDER_PASSES:
       rounder_pass_ests = {
-          x: (np.floor(l2_pass_ests[x]).astype(int) +  # pyrefly: ignore[unsupported-operation]
-              integer_variable_values(result, model_variables[x]))
-          for x in child_geocodes}
+          x: (
+              np.floor(l2_pass_ests[x]).astype(int)  # pyrefly: ignore[unsupported-operation]
+              + integer_variable_values(result, model_variables[x])
+          )
+          for x in child_geocodes
+      }
+      total_pass_values = (
+          rounder_pass_ests
+          if objective_function_type in constants.TOTAL_ONLY_PASSES
+          else None
+      )
 
   if rounder_pass_ests is None:
-    if constants.USE_ALTERNATE_PASSES and rounder_pass_ests is None:
-      logging.info('No rounder pass run; returning L2 pass estimates')
-      rounder_pass_ests = {x: np.array(l2_pass_ests[x])  # pyrefly: ignore[unsupported-operation]
-                           for x in child_geocodes}
-    else:
-      raise ValueError('No model variables or result returned.')
+    raise ValueError('No model variables or result returned.')
   return rounder_pass_ests  # pyrefly: ignore[bad-return]
 
 
 def run_node_baseline_passes(
-    block_shape: block.BlockShape,
     objective_function_types: Sequence[constants.ObjectiveFunctionType],
     parent_geocode: str,
     child_geocodes: Sequence[str],
@@ -1554,13 +1444,13 @@ def run_node_baseline_passes(
     children_upper_bound_dict: dict[str, Sequence[int]],
     children_lower_bound_dict: dict[str, Sequence[int]],
     subtree_total_dict: None | dict[str, int] = None,
+    solve_parameters: mathopt.SolveParameters | None = None,
 ) -> dict[str, Sequence[int]]:
-  """Run optimization passes for block hierarchical postprocessing.
+  """Run baseline optimization passes for block hierarchical postprocessing.
 
   Args:
-    block_shape: The BlockShape object describing the block structure.
-    objective_function_types: The list of objective function types to run.
-      Must contain at least one L2 pass and one rounder pass.
+    objective_function_types: The list of objective function types to run. Must
+      contain at least one L2 pass and one rounder pass.
     parent_geocode: The geocode of the parent node.
     child_geocodes: The geocodes of the child nodes.
     parent_val: The parent value for each type.
@@ -1575,6 +1465,7 @@ def run_node_baseline_passes(
     subtree_total_dict: A dictionary mapping state-level geocodes to totals. If
       provided, then the sum of the variables for the AIAN and non-AIAN subtrees
       for that state must equal the total.
+    solve_parameters: Optional SolveParameters to pass to the solver.
 
   Returns:
     A dictionary mapping child geocodes to estimates of child nodes.
@@ -1582,10 +1473,35 @@ def run_node_baseline_passes(
   total_pass_values = None
   l2_pass_ests, rounder_pass_ests = None, None
   for objective_function_type in objective_function_types:
+    logging.info('Running baseline pass %s', objective_function_type.name)
 
-    if objective_function_type in constants.L2_PASSES:
+    if objective_function_type in constants.ROUNDER_PASSES:
+      # If this is a rounder pass, retrieve the child estimates from the
+      # previous pass and run regular rounder pass since it is the same as the
+      # baseline rounder pass.
+      if l2_pass_ests is None:
+        raise ValueError('Cannot run rounder pass without previous L2 pass')
+      child_ests_non_baseline = {
+          geocode: estimate.Estimate(
+              val=l2_pass_ests[geocode],  # pyrefly: ignore[bad-argument-type]
+              cov=succinct.SuccinctCovariance.identity(),
+          )
+          for geocode in child_geocodes
+      }
+      model_variables, result = run_node_optimization(
+          objective_function_type=objective_function_type,
+          parent_geocode=parent_geocode,
+          child_geocodes=child_geocodes,
+          parent_val=parent_val,
+          child_ests=child_ests_non_baseline,
+          children_upper_bound_dict=children_upper_bound_dict,
+          children_lower_bound_dict=children_lower_bound_dict,
+          total_pass_values=total_pass_values,
+          subtree_total_dict=subtree_total_dict,
+          solve_parameters=solve_parameters,
+      )
+    else:
       model_variables, result = run_baseline_node_optimization(
-          block_shape=block_shape,
           objective_function_type=objective_function_type,
           parent_geocode=parent_geocode,
           child_geocodes=child_geocodes,
@@ -1595,64 +1511,34 @@ def run_node_baseline_passes(
           children_lower_bound_dict=children_lower_bound_dict,
           total_pass_values=total_pass_values,
           subtree_total_dict=subtree_total_dict,  # pyrefly: ignore[bad-argument-type]
+          solve_parameters=solve_parameters,
       )
-    elif objective_function_type in constants.ROUNDER_PASSES:
-      # If this is a rounder pass, retrieve the child estimates from the
-      # previous pass.
-      if l2_pass_ests is None:
-        raise ValueError('Cannot run rounder pass without previous L2 pass')
-      child_ests = {  # pyrefly: ignore[bad-assignment]
-          geocode: estimate.Estimate(
-              val=l2_pass_ests[geocode],  # pyrefly: ignore[bad-argument-type]
-              cov=np.array(0))
-          for geocode in child_geocodes
-      }
-      # Run regular rounder pass, since it's the same as baseline rounder pass.
-      model_variables, result = run_node_optimization(
-          block_shape=block_shape,
-          objective_function_type=objective_function_type,
-          parent_geocode=parent_geocode,
-          child_geocodes=child_geocodes,
-          parent_val=parent_val,
-          child_ests=child_ests,  # pyrefly: ignore[bad-argument-type]
-          children_upper_bound_dict=children_upper_bound_dict,
-          children_lower_bound_dict=children_lower_bound_dict,
-          total_pass_values=total_pass_values,
-          subtree_total_dict=subtree_total_dict,
-      )
-    else:
-      raise ValueError('Objective function must be an L2 or rounder pass.')
 
-    # Set total_pass_values if we have just completed a total pass.
-    if objective_function_type in constants.TOTAL_ONLY_PASSES:
-      if objective_function_type in constants.L2_PASSES:
-        total_pass_values = {
-            geocode: variable_values(result, ests)
-            for geocode, ests in model_variables.items()
-        }
-      else:  # objective_function_type in constants.ROUNDER_PASSES:
-        total_pass_values = {
-            geocode: integer_variable_values(result, ests)
-            for geocode, ests in model_variables.items()
-        }
-    else:
-      total_pass_values = None
-
-    # Update last pass estimates.
+    # Update last pass estimates and set total_pass_values if we have just
+    # completed a total pass.
     if objective_function_type in constants.L2_PASSES:
-      l2_pass_ests = {x: variable_values(result, model_variables[x])
-                      for x in child_geocodes}
+      l2_pass_ests = {
+          x: variable_values(result, model_variables[x]) for x in child_geocodes
+      }
+      total_pass_values = (
+          l2_pass_ests
+          if objective_function_type in constants.TOTAL_ONLY_PASSES
+          else None
+      )
     elif objective_function_type in constants.ROUNDER_PASSES:
       rounder_pass_ests = {
-          x: (np.floor(l2_pass_ests[x]).astype(int) +  # pyrefly: ignore[unsupported-operation]
-              integer_variable_values(result, model_variables[x]))
-          for x in child_geocodes}
+          x: (
+              np.floor(l2_pass_ests[x]).astype(int)  # pyrefly: ignore[unsupported-operation]
+              + integer_variable_values(result, model_variables[x])
+          )
+          for x in child_geocodes
+      }
+      total_pass_values = (
+          rounder_pass_ests
+          if objective_function_type in constants.TOTAL_ONLY_PASSES
+          else None
+      )
 
   if rounder_pass_ests is None:
-    if constants.USE_ALTERNATE_PASSES and rounder_pass_ests is None:
-      logging.info('No rounder pass run; returning L2 pass estimates')
-      rounder_pass_ests = {x: np.array(l2_pass_ests[x])  # pyrefly: ignore[unsupported-operation]
-                           for x in child_geocodes}
-    else:
-      raise ValueError('Must run a rounder pass.')
+    raise ValueError('No model variables or result returned.')
   return rounder_pass_ests  # pyrefly: ignore[bad-return]

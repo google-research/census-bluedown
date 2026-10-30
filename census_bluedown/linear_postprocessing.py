@@ -12,28 +12,47 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Best unbiased linear estimator for histograms on blocks of estimates.
+"""Best linear unbiased estimator for histograms on hierarchical blocks of estimates.
 
-This generalizes the algorithm described in this paper to vectors of queries:
-https://ceur-ws.org/Vol-3556/adkdd23-dawson-optimizing-ceur-paper.pdf
+This module computes the best linear unbiased estimate (BLUE) for histograms
+partitioned across a tree hierarchy of geographic blocks. The hierarchy is
+represented by string geocodes in the ID column, where each parent's ID is a
+fixed-length prefix of its children's IDs. The algorithm is described in
+https://arxiv.org/abs/2603.10099, which is also the reference for the lemma,
+equation, and algorithm numbers cited throughout this package.
 
 The input and output data for this algorithm consists of separate DataFrames for
 each level of the hierarchy. The input DataFrames for the block-level processing
-method contains one row for each combination of block ID and query shape, and
-consists of columns ID, QUERY_SHAPE, VARIANCE, and VALUE, with types string,
-tuple[int], numpy.ndarray, and numpy.ndarray, respectively. The input and output
+method contain one row for each combination of block ID and query shape, and
+consist of columns ID, QUERY_SHAPE, VARIANCE, and VALUE, with types string,
+tuple[int], float, and numpy.ndarray, respectively. The input and output
 DataFrames for the bottom-up and top-down processing methods, as well as the
 output DataFrame for the block-level processing method, contain a single row for
 each geo ID and consist of columns ID and ESTIMATE, with types string and
 estimate.Estimate, respectively.
+
+The algorithm proceeds in three main stages:
+1. Block-level processing (process_blocks): Computes an initial estimate for
+   each individual block from its set of noisy query measurements using
+   generalized least squares (GLS) regression.
+2. Bottom-up step (bottom_up_step): Propagates estimates up the tree hierarchy.
+   For each parent block, the lower inclusive estimate is computed by
+   combining its own input estimate with the sum of the lower inclusive
+   estimates of its children.
+3. Top-down step (top_down_step): Propagates estimates down the tree hierarchy.
+   For each child block, it computes the upper exclusive estimate by
+   subtracting the sum of sibling estimates from the parent's upper inclusive
+   estimate. It then computes the final combined estimate (the global BLUE
+   given all queries in the hierarchy) by combining the lower and upper
+   exclusive estimates, and computes the upper inclusive estimate to pass down
+   to descendant blocks.
 """
 
 import pandas as pd
-from census_bluedown import block
 from census_bluedown import constants
 from census_bluedown import estimate
+from census_bluedown import query_encoding
 from census_bluedown import regression
-
 
 ID = constants.ID
 ID_PREFIX = constants.ID_PREFIX
@@ -44,21 +63,21 @@ VALUE = constants.VALUE
 
 
 def _process_df_block(
-    block_shape: block.BlockShape,
     df: pd.DataFrame,
 ) -> estimate.Estimate:
-  """Postprocesses the block in the input dataframe."""
+  """Computes the initial block estimate from its noisy queries via GLS."""
   query_shapes = tuple(df[QUERY_SHAPE])
   query_variances = tuple(df[VARIANCE])
   query_values = tuple(df[VALUE])
 
-  return estimate.Estimate(*regression.process_queries(
-      block_shape, query_shapes, query_variances, query_values
-  ))
+  workload, cov, y = query_encoding.prepare_succinct_inputs(
+      query_shapes, query_variances, query_values
+  )
+
+  return estimate.Estimate(*regression.compute_gls_estimate(workload, cov, y))
 
 
 def process_blocks(
-    block_shape: block.BlockShape,
     df: pd.DataFrame,
 ) -> pd.DataFrame:
   """Postprocess each block in the input dataframe.
@@ -67,17 +86,18 @@ def process_blocks(
   block given only the queries on that block.
 
   Args:
-    block_shape: The BlockShape object describing the block structure.
-    df: A DataFrame with columns ID, QUERY_SHAPE, VARIANCE, VALUE.
+    df: A DataFrame with columns ID, QUERY_SHAPE, VARIANCE, and VALUE.
 
   Returns:
     A DataFrame with columns ID and ESTIMATE, with one row for each block ID.
-    The ESTIMATE column contains the best linear unbiased estimate for the
-    block given only the queries on that block.
+    The ESTIMATE column contains the block GLS estimate for the block given
+    only the queries on that block.
   """
-  return df.groupby(ID).apply(
-      lambda x: _process_df_block(block_shape=block_shape, df=x)
-  ).reset_index(name=ESTIMATE)  # pyrefly: ignore[no-matching-overload]
+  return (
+      df.groupby(ID)
+      .apply(_process_df_block)
+      .reset_index(name=ESTIMATE)  # pyrefly: ignore[no-matching-overload]
+  )
 
 
 def _aggregate_child_estimates(
@@ -103,21 +123,23 @@ def _aggregate_child_estimates(
     child estimates of the children of the parent.
   """
   # Parent ID is a fixed-length prefix of the child ID.
-  parent_id_length = len(parents_df[ID][0])
-  children_df[ID_PREFIX] = children_df[ID].str[:parent_id_length]
+  parent_id_length = len(parents_df[ID].iloc[0])
   children_grouped = (
-      children_df[[ID_PREFIX, ESTIMATE]]
-      .groupby(ID_PREFIX)  # Group by parent ID
-      .agg('sum')          # Aggregate child estimates per parent
-      .reset_index()
-      .rename(columns={ID_PREFIX: ID}))
+      children_df.assign(**{ID: children_df[ID].str[:parent_id_length]})
+      .groupby(ID, as_index=False)[ESTIMATE]  # Group by parent ID
+      .sum()  # Aggregate child estimates per parent
+  )
 
-  return pd.merge(parents_df, children_grouped, how='outer', on=ID,
-                  suffixes=(parent_suffix, child_suffix))
+  return pd.merge(
+      parents_df,
+      children_grouped,
+      how="outer",
+      on=ID,
+      suffixes=(parent_suffix, child_suffix),
+  )
 
 
 def bottom_up_step(
-    block_shape: block.BlockShape,
     children_lower_df: pd.DataFrame,
     parents_input_df: pd.DataFrame,
 ) -> pd.DataFrame:
@@ -132,7 +154,6 @@ def bottom_up_step(
   these two estimates.
 
   Args:
-    block_shape: The BlockShape object describing the block structure.
     children_lower_df: A DataFrame with columns ID and ESTIMATE containing lower
       inclusive estimates of the children.
     parents_input_df: A DataFrame with columns ID and ESTIMATE containing
@@ -140,30 +161,30 @@ def bottom_up_step(
 
   Returns:
     A DataFrame with columns ID and ESTIMATE. The ESTIMATE column contains the
-    inclusive lower estimates of the parents, which are the best linear unbiased
+    lower inclusive estimates of the parents, which are the best linear unbiased
     estimates given only the queries on a block and its descendants.
   """
   # Aggregate child estimates by parent ID.
-  parent_suffix = '_parent'
-  child_lower_sum_suffix = '_child_lower_sum'
+  parent_suffix = "_parent"
+  child_lower_sum_suffix = "_child_lower_sum"
   parents_df = _aggregate_child_estimates(
-      children_df=children_lower_df, parents_df=parents_input_df,
-      parent_suffix=parent_suffix, child_suffix=child_lower_sum_suffix,
+      children_df=children_lower_df,
+      parents_df=parents_input_df,
+      parent_suffix=parent_suffix,
+      child_suffix=child_lower_sum_suffix,
   )
 
   # Combine aggregated child estimates with parent estimates of the same ID.
-  lower_estimate_column = 'lower_estimate'
-  parents_df[lower_estimate_column] = parents_df.apply(
+  lower_estimate = parents_df.apply(
       lambda x: regression.combine(
-          block_shape,
-          x[ESTIMATE + child_lower_sum_suffix],
-          x[ESTIMATE + parent_suffix]
+          x[ESTIMATE + child_lower_sum_suffix], x[ESTIMATE + parent_suffix]
       ),
-      axis=1
-    )
-  parents_lower_df = (parents_df[[ID, lower_estimate_column]]
-                      .rename(columns={lower_estimate_column: ESTIMATE}))
-  return parents_lower_df
+      axis=1,
+  )
+  return pd.DataFrame({
+      ID: parents_df[ID],
+      ESTIMATE: lower_estimate,
+  })
 
 
 def _compute_upper_exclusive_estimate(
@@ -194,7 +215,7 @@ def _compute_upper_exclusive_estimate(
     parent_estimate_column: The name of the column in parents_df containing the
       parent estimate.
     child_lower_sum_estimate_column: The name of the column in parents_df
-      containing the sum of the lower estimates of the siblings.
+      containing the sum of the lower estimates of all children of the parent.
     lower_estimate_column: The name of the column in the output DataFrame
       containing the estimate from the input children_df.
     upper_exclusive_estimate_column: The name of the column in the output
@@ -204,35 +225,41 @@ def _compute_upper_exclusive_estimate(
     A DataFrame with columns ID, lower_estimate_column, and
     upper_exclusive_estimate_column.
   """
-  parent_id_length = len(parents_df[ID][0])
-  children_df[ID_PREFIX] = children_df[ID].str[:parent_id_length]
-  parents_df.rename(columns={ID: ID_PREFIX}, inplace=True)
-  children_df = pd.merge(
-      children_df,
-      parents_df[[ID_PREFIX,
-                  parent_estimate_column,
-                  child_lower_sum_estimate_column]],
-      how='inner',
+  parent_id_length = len(parents_df[ID].iloc[0])
+  # Slice parents_df with ID renamed to ID_PREFIX for merging.
+  parents_slice = parents_df[[
+      ID,
+      parent_estimate_column,
+      child_lower_sum_estimate_column,
+  ]].rename(columns={ID: ID_PREFIX})
+
+  # Add ID_PREFIX to children_df for merging.
+  children_with_prefix = children_df.assign(
+      **{ID_PREFIX: children_df[ID].str[:parent_id_length]}
+  )
+
+  merged = pd.merge(
+      children_with_prefix,
+      parents_slice,
+      how="inner",
       on=ID_PREFIX,
   )
-  children_df.rename(columns={ESTIMATE: lower_estimate_column}, inplace=True)
+
   # parent upper estimate plus estimate of node minus estimate of (node plus
   # siblings) using overloaded operator % to handle subtraction of covariance
   # correctly
-  children_df[upper_exclusive_estimate_column] = (
-      children_df[parent_estimate_column] -
-      (children_df[child_lower_sum_estimate_column]
-       % children_df[lower_estimate_column])
+  upper_exclusive = merged[parent_estimate_column] - (
+      merged[child_lower_sum_estimate_column] % merged[ESTIMATE]
   )
-  children_df.drop(columns=[parent_estimate_column,
-                            child_lower_sum_estimate_column,
-                            ID_PREFIX],
-                   inplace=True)
-  return children_df
+
+  return pd.DataFrame({
+      ID: merged[ID],
+      lower_estimate_column: merged[ESTIMATE],
+      upper_exclusive_estimate_column: upper_exclusive,
+  })
 
 
 def _compute_combined_estimate(
-    block_shape: block.BlockShape,
     children_df: pd.DataFrame,
     lower_estimate_column: str,
     upper_exclusive_estimate_column: str,
@@ -246,7 +273,6 @@ def _compute_combined_estimate(
   estimate and the upper exclusive estimate.
 
   Args:
-    block_shape: The BlockShape object describing the block structure.
     children_df: A DataFrame with columns ID, lower_estimate_column, and
       upper_exclusive_estimate_column.
     lower_estimate_column: The name of the column in children_df containing the
@@ -258,26 +284,19 @@ def _compute_combined_estimate(
     A DataFrame with columns ID and ESTIMATE. The ESTIMATE column contains the
     combined estimate.
   """
-  combined_estimate_column = 'combined_estimate'
-  children_df[combined_estimate_column] = children_df.apply(
+  combined_estimate = children_df.apply(
       lambda x: regression.combine(
-          block_shape,
-          x[lower_estimate_column],
-          x[upper_exclusive_estimate_column]
+          x[lower_estimate_column], x[upper_exclusive_estimate_column]
       ),
-      axis=1
+      axis=1,
   )
-
-  # Rename columns
-  children_combined_df = children_df[[ID, combined_estimate_column]].copy(
-      deep=False)
-  children_combined_df.rename(columns={combined_estimate_column: ESTIMATE},
-                              inplace=True)
-  return children_combined_df
+  return pd.DataFrame({
+      ID: children_df[ID],
+      ESTIMATE: combined_estimate,
+  })
 
 
 def _compute_upper_estimate(
-    block_shape: block.BlockShape,
     children_df: pd.DataFrame,
     children_input_df: pd.DataFrame,
     upper_exclusive_estimate_column: str,
@@ -292,8 +311,8 @@ def _compute_upper_estimate(
   upper exclusive estimate.
 
   Args:
-    block_shape: The BlockShape object describing the block structure.
-    children_df: A DataFrame with columns ID, upper_exclusive_estimate_column.
+    children_df: A DataFrame with columns ID and
+      upper_exclusive_estimate_column.
     children_input_df: A DataFrame with columns ID and ESTIMATE.
     upper_exclusive_estimate_column: The name of the column in children_df
       containing the upper exclusive estimate.
@@ -302,34 +321,28 @@ def _compute_upper_estimate(
     A DataFrame with columns ID and ESTIMATE. The ESTIMATE column contains the
     upper inclusive estimate.
   """
-  input_estimate_column = 'input_estimate'
-  upper_estimate_column = 'upper_estimate'
-  children_df = pd.merge(children_df, children_input_df, how='outer', on=ID,
-                         copy=False)
-  children_df.rename(columns={ESTIMATE: input_estimate_column}, inplace=True)
-
-  children_df[upper_estimate_column] = children_df.apply(
-      lambda x: regression.combine(
-          block_shape,
-          x[input_estimate_column],
-          x[upper_exclusive_estimate_column]
-      ),
-      axis=1
+  merged = pd.merge(
+      children_df[[ID, upper_exclusive_estimate_column]],
+      children_input_df[[ID, ESTIMATE]],
+      how="outer",
+      on=ID,
   )
-  children_df.drop(columns=input_estimate_column, inplace=True)
-
-  # Rename columns
-  children_upper_df = children_df[[ID, upper_estimate_column]].copy(deep=False)
-  children_upper_df.rename(columns={upper_estimate_column: ESTIMATE},
-                           inplace=True)
-  return children_upper_df
+  upper_estimate = merged.apply(
+      lambda x: regression.combine(
+          x[ESTIMATE], x[upper_exclusive_estimate_column]
+      ),
+      axis=1,
+  )
+  return pd.DataFrame({
+      ID: merged[ID],
+      ESTIMATE: upper_estimate,
+  })
 
 
 def top_down_step(
-    block_shape: block.BlockShape,
     children_input_df: pd.DataFrame,
     children_lower_df: pd.DataFrame,
-    parents_upper_df: pd.DataFrame
+    parents_upper_df: pd.DataFrame,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
   """Top down step of linear postprocessing algorithm.
 
@@ -349,19 +362,19 @@ def top_down_step(
   input estimate of a block and (2) the upper exclusive estimate of the block,
   and taking the optimal combination of these two estimates.
 
-  The combined estimate is the best linear unbiased estimates given all queries
+  The combined estimate is the best linear unbiased estimate given all queries
   to all blocks. It is computed by taking (1) the lower estimate of a block and
   (2) the upper exclusive estimate of the block, and taking the optimal
   combination of these two estimates.
 
   Args:
-    block_shape: The BlockShape object describing the block structure.
     children_input_df: A DataFrame with columns ID and ESTIMATE containing input
       estimates of the children.
     children_lower_df: A DataFrame with columns ID and ESTIMATE containing lower
       inclusive estimates of the children.
     parents_upper_df: A DataFrame with columns ID and ESTIMATE containing upper
       inclusive estimates of the parents.
+
   Returns:
     children_upper_df: A DataFrame with columns ID and ESTIMATE containing upper
       inclusive estimates of the children.
@@ -369,16 +382,18 @@ def top_down_step(
       combined (best linear unbiased) estimates of the children.
   """
   # Aggregate child estimates by parent ID.
-  parent_suffix = '_parent'
-  child_lower_sum_suffix = '_child_lower_sum'
+  parent_suffix = "_parent"
+  child_lower_sum_suffix = "_child_lower_sum"
   parents_df = _aggregate_child_estimates(
-      children_df=children_lower_df, parents_df=parents_upper_df,
-      parent_suffix=parent_suffix, child_suffix=child_lower_sum_suffix,
+      children_df=children_lower_df,
+      parents_df=parents_upper_df,
+      parent_suffix=parent_suffix,
+      child_suffix=child_lower_sum_suffix,
   )
 
   # Compute upper exclusive estimate for each child
-  upper_exclusive_estimate_column = 'upper_exclusive_estimate'
-  lower_estimate_column = 'lower_estimate'
+  upper_exclusive_estimate_column = "upper_exclusive_estimate"
+  lower_estimate_column = "lower_estimate"
   children_df = _compute_upper_exclusive_estimate(
       children_df=children_lower_df,
       parents_df=parents_df,
@@ -390,16 +405,13 @@ def top_down_step(
 
   # Combine lower estimate and upper exclusive estimate to get combined estimate
   children_combined_df = _compute_combined_estimate(
-      block_shape=block_shape,
       children_df=children_df,
       lower_estimate_column=lower_estimate_column,
       upper_exclusive_estimate_column=upper_exclusive_estimate_column,
   )
-  children_df.drop(columns=lower_estimate_column, inplace=True)
 
   # Combine input estimate and upper exclusive estimate to get upper estimate
   children_upper_df = _compute_upper_estimate(
-      block_shape=block_shape,
       children_df=children_df,
       children_input_df=children_input_df,
       upper_exclusive_estimate_column=upper_exclusive_estimate_column,

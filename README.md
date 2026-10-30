@@ -32,12 +32,37 @@ For example, these could be downloaded from
 [Harvard Dataverse](https://doi.org/10.7910/DVN/5LAVKV). For using this
 codebase, we require that `2020-pl94-nmf-parquets.zip` is downloaded
 and extracted at the location `data/2020-pl94-nmf-parquets`.
+
 * [Privacy-Protected Microdata File (PPMF)](https://www.census.gov/data/tables/2024/dec/2020-census-ppmf.html).
 Specifically, for using this codebase, we require that `2020_ppmf_bystate.zip`
 available at
 [this link](https://www2.census.gov/programs-surveys/decennial/2020/data/privacy-protected-microdata-file),
 is saved at the location `data/2020_ppmf_bystate.zip`. **Note:** This
 should remain as a ZIP file and should not be extracted.
+
+*   **Statewide Population Totals:** This file is already included in the
+    repository under `data/state-totals/US/state_totals.parquet` and contains
+    the **2020 U.S. Census** statewide resident population totals from the U.S.
+    Census Bureau's
+    [2020 Census Apportionment Data](https://www.census.gov/data/tables/2020/dec/2020-apportionment-data.html)
+    ([Table 2](https://www2.census.gov/programs-surveys/decennial/2020/data/apportionment/apportionment-2020-table02.pdf))
+    (for a different year or dataset, one would have to create a file in the
+    same format with the appropriate totals). The included file has 51 rows
+    (the 50 U.S. states and the District of Columbia) with three columns:
+
+    *   `geocode` (`str`): 2-digit state FIPS code (`'01'` through `'56'`).
+    *   `name` (`str`): State or territory name.
+    *   `value` (`int64`): Invariant statewide total resident population.
+
+    This file is required by the root-level (US national) passes
+    (`--subtree_totals_dir="data/state-totals"`). In the NMF hierarchy, states
+    with American Indian & Alaska Native (AIAN) areas are split into separate
+    AIAN (`1XX`) and non-AIAN (`0XX`) subtrees; while each state's combined
+    population is an exact invariant, individual subtree populations are not.
+    The BlueDown passes and baseline Census TopDown passes read
+    `state_totals.parquet` to enforce that the sum of the AIAN and non-AIAN
+    subtree estimates for each state equals its exact statewide population
+    `value` (and that the US root total equals the sum across all states).
 
 ## Gurobi Solver License Setup
 
@@ -113,28 +138,28 @@ FOLDER_IDS_2020=(
 )
 
 PPMF_ZIP_PATH="data/2020_ppmf_bystate.zip"
-NMF_DIR="data/2020-pl94-nmf-parquets/US_Person_PL_PROD/"
-SUBTREE_TOTALS_DIR="data/state-totals/"
-SYNTHETIC_GROUND_TRUTH="output/synthetic-ground-truth/"
-SYNTHETIC_NMF="output/synthetic-nmf/"
-SYNTHETIC_PROCESSED="output/synthetic-processed/"
+NMF_DIR="data/2020-pl94-nmf-parquets/US_Person_PL_PROD"
+SUBTREE_TOTALS_DIR="data/state-totals"
+SYNTHETIC_GROUND_TRUTH="output/synthetic-ground-truth"
+SYNTHETIC_NMF="output/synthetic-nmf-replicates"
+SYNTHETIC_PROCESSED="output/synthetic-processed-replicates"
+SEED="1234"
 ```
 
 ### 1. Synthetic Data Generation (`generate_synthetic_data.py`)
 
 Our experiments use the Privacy-Protected Microdata File (PPMF) provided by the
-Census Bureau as the "ground truth", and generates synthetic versions of the
-Noisy Measurement File (NMF) by adding discrete Gaussian noise of the
-appropriate scale for each query.
+Census Bureau as the "ground truth", and generates 10 independent synthetic
+replicates (`0` through `9`) of the Noisy Measurement File (NMF) by adding
+discrete Gaussian noise of the appropriate scale for each query.
 
 The following commands prepare the ground truth dataset, and synthetic datasets.
 
 **Note:** While we provide the commands to run the entire algorithms on a single
 machine, in practice, this will take a prohibitively long time. We parallelized
 this by running the command presented inside `for` loops (each loop step for a
-separate state) on independent machines. We do not provide the code for this
-parallelization infrastructure, since we used a custom parallelization
-infrastructure that cannot be open-sourced.
+separate state and replicate) on independent machines. We do not provide the
+code for this parallelization infrastructure.
 
 * **Pass 1: Ground Truth Generation (`--pass=ground_truth`)**
 
@@ -169,35 +194,47 @@ infrastructure that cannot be open-sourced.
 
 * **Pass 2: Synthetic NMF Generation (`--pass=nmf`)**
 
+    For each replicate `i` in `{0..9}`, synthetic NMFs are generated using seed
+    `${i}${SEED}` (which is concatenated with the 3-digit `state` subtree ID for
+    state-level jobs) and saved under `output/synthetic-nmf-replicates/${i}`.
+
     * **Synthetic NMF for all States**
 
-      Generates synthetic noisy measurement files (NMF) from ground-truth
-      tables (`--ground_truth_dir`) for each state subtree:
+        Generates synthetic noisy measurement files (NMF) from ground-truth
+        tables (`--ground_truth_dir`) for each state subtree and replicate:
 
-      ```bash
-      for state in "${FOLDER_IDS_2020[@]}"; do
-        python3 census_bluedown/generate_synthetic_data.py \
-          --pass=nmf \
-          --state="${state}" \
-          --ground_truth_dir="${SYNTHETIC_GROUND_TRUTH}" \
-          --out_dir="${SYNTHETIC_NMF}" \
-          --seed=1234
-      done
-      ```
+        ```bash
+        for replicate in {0..9}; do
+          for state in "${FOLDER_IDS_2020[@]}"; do
+            python3 census_bluedown/generate_synthetic_data.py \
+              --pass=nmf \
+              --state="${state}" \
+              --ground_truth_dir="${SYNTHETIC_GROUND_TRUTH}" \
+              --out_dir="${SYNTHETIC_NMF}/${replicate}" \
+              --seed="${replicate}${SEED}"
+          done
+        done
+        ```
 
     * **Synthetic NMF for US (Root)**
 
-      Generates synthetic NMF for the US national level (root):
+        Generates synthetic NMF for the US national level (root) for each
+        replicate:
 
-      ```bash
-      python3 census_bluedown/generate_synthetic_data.py \
-        --pass=nmf \
-        --ground_truth_dir="${SYNTHETIC_GROUND_TRUTH}" \
-        --out_dir="${SYNTHETIC_NMF}" \
-        --seed=1234
-      ```
+        ```bash
+        for replicate in {0..9}; do
+          python3 census_bluedown/generate_synthetic_data.py \
+            --pass=nmf \
+            --ground_truth_dir="${SYNTHETIC_GROUND_TRUTH}" \
+            --out_dir="${SYNTHETIC_NMF}/${replicate}" \
+            --seed="${replicate}${SEED}"
+        done
+        ```
 
 ### 2. Postprocessing Pipelines (BlueDown and TopDown)
+
+For each replicate `i` in `{0..9}`, postprocessed outputs are saved under
+`output/synthetic-processed-replicates/${i}`.
 
 #### 2.1. BlueDown Algorithm
 
@@ -207,61 +244,69 @@ Postprocessing runs in **2 stages** (each with 2 sub-steps).
 
     * **Bottom-Up Pass for all States**
 
-      Initializes input estimates and aggregates variances bottom-up for
-      individual state subtrees:
+        Initializes input estimates and aggregates variances bottom-up for
+        individual state subtrees:
 
-      ```bash
-      for state in "${FOLDER_IDS_2020[@]}"; do
-        python3 census_bluedown/run_pass.py \
-          --pass=bottom_up \
-          --state="${state}" \
-          --nmf_dir="${SYNTHETIC_NMF}" \
-          --out_dir="${SYNTHETIC_PROCESSED}"
-      done
-      ```
+        ```bash
+        for replicate in {0..9}; do
+          for state in "${FOLDER_IDS_2020[@]}"; do
+            python3 census_bluedown/run_pass.py \
+              --pass=bottom_up \
+              --state="${state}" \
+              --nmf_dir="${SYNTHETIC_NMF}/${replicate}" \
+              --out_dir="${SYNTHETIC_PROCESSED}/${replicate}"
+          done
+        done
+        ```
 
     * **Bottom-Up Pass for US (Root)**
 
-      Combines state-level totals to construct national (US root) bottom-up
-      totals:
+        Combines state-level totals to construct national (US root) bottom-up
+        totals:
 
-      ```bash
-      python3 census_bluedown/run_pass.py \
-        --pass=bottom_up \
-        --nmf_dir="${SYNTHETIC_NMF}" \
-        --out_dir="${SYNTHETIC_PROCESSED}" \
-        --subtree_totals_dir="${SUBTREE_TOTALS_DIR}"
-      ```
+        ```bash
+        for replicate in {0..9}; do
+          python3 census_bluedown/run_pass.py \
+            --pass=bottom_up \
+            --nmf_dir="${SYNTHETIC_NMF}/${replicate}" \
+            --out_dir="${SYNTHETIC_PROCESSED}/${replicate}" \
+            --subtree_totals_dir="${SUBTREE_TOTALS_DIR}"
+        done
+        ```
 
 * **Pass 2: Top-Down Pass (`--pass=top_down`)**
 
     * **Top-Down Pass for US (Root)**
 
-      Runs non-linear optimization at the root level to establish consistent
-      national upper bounds:
+        Runs non-linear optimization at the root level to establish consistent
+        national upper bounds:
 
-      ```bash
-      python3 census_bluedown/run_pass.py \
-        --pass=top_down \
-        --in_dir="${SYNTHETIC_PROCESSED}" \
-        --out_dir="${SYNTHETIC_PROCESSED}" \
-        --subtree_totals_dir="${SUBTREE_TOTALS_DIR}"
-      ```
+        ```bash
+        for replicate in {0..9}; do
+          python3 census_bluedown/run_pass.py \
+            --pass=top_down \
+            --in_dir="${SYNTHETIC_PROCESSED}/${replicate}" \
+            --out_dir="${SYNTHETIC_PROCESSED}/${replicate}" \
+            --subtree_totals_dir="${SUBTREE_TOTALS_DIR}"
+        done
+        ```
 
     * **Top-Down Pass for all States**
 
-      Runs top-down constrained optimization down to individual census blocks
-      using root bounds:
+        Runs top-down constrained optimization down to individual census blocks
+        using root bounds:
 
-      ```bash
-      for state in "${FOLDER_IDS_2020[@]}"; do
-        python3 census_bluedown/run_pass.py \
-          --pass=top_down \
-          --state="${state}" \
-          --in_dir="${SYNTHETIC_PROCESSED}" \
-          --out_dir="${SYNTHETIC_PROCESSED}"
-      done
-      ```
+        ```bash
+        for replicate in {0..9}; do
+          for state in "${FOLDER_IDS_2020[@]}"; do
+            python3 census_bluedown/run_pass.py \
+              --pass=top_down \
+              --state="${state}" \
+              --in_dir="${SYNTHETIC_PROCESSED}/${replicate}" \
+              --out_dir="${SYNTHETIC_PROCESSED}/${replicate}"
+          done
+        done
+        ```
 
 #### 2.2. Baseline Census Top-Down Algorithm (`--pass=baseline_census_topdown`)
 
@@ -270,56 +315,116 @@ The commands below run our implementation of the Census Top-Down algorithm of
 
 * **Top-Down Pass for US (Root)**
 
-  ```bash
-  python3 census_bluedown/run_pass.py \
-    --pass=baseline_census_topdown \
-    --nmf_dir="${SYNTHETIC_NMF}" \
-    --out_dir="${SYNTHETIC_PROCESSED}" \
-    --subtree_totals_dir="${SUBTREE_TOTALS_DIR}"
-  ```
+    ```bash
+    for replicate in {0..9}; do
+      python3 census_bluedown/run_pass.py \
+        --pass=baseline_census_topdown \
+        --nmf_dir="${SYNTHETIC_NMF}/${replicate}" \
+        --out_dir="${SYNTHETIC_PROCESSED}/${replicate}" \
+        --subtree_totals_dir="${SUBTREE_TOTALS_DIR}"
+    done
+    ```
 
 * **Top-Down Pass for all States**
 
-  ```bash
-  for state in "${FOLDER_IDS_2020[@]}"; do
-    python3 census_bluedown/run_pass.py \
-      --pass=baseline_census_topdown \
-      --state="${state}" \
-      --nmf_dir="${SYNTHETIC_NMF}" \
-      --out_dir="${SYNTHETIC_PROCESSED}"
-  done
-  ```
+    ```bash
+    for replicate in {0..9}; do
+      for state in "${FOLDER_IDS_2020[@]}"; do
+        python3 census_bluedown/run_pass.py \
+          --pass=baseline_census_topdown \
+          --state="${state}" \
+          --nmf_dir="${SYNTHETIC_NMF}/${replicate}" \
+          --out_dir="${SYNTHETIC_PROCESSED}/${replicate}"
+      done
+    done
+    ```
 
 ### 3. Error Evaluation
 
-Computes error metrics comparing postprocessed outputs with ground-truth
-tables:
+Computes error metrics comparing postprocessed outputs with ground-truth tables
+across geographic levels (`Block`, `Block_Group`, `Tract`, `County`, and
+`State`):
+
+<!-- mdformat off(prevent table wrapping) -->
+
+| Pass | Description |
+| :--- | :--- |
+| `compute_errors` | Mean L1 error across geographic units for standard marginal and joint workload queries (`TOTAL`, `HOUSING_TYPE`, `VOTINGAGE`, `HISPANIC`, `CENRACE`, `HISPANICxCENRACE`, `AGExHISPxCENRACE` and `DETAILED`). |
+| `compute_alternate_errors` | Elementwise mean absolute error across geographic units for a subset of the [2020 Census Production Disclosure Avoidance System Detailed Summary Metrics](https://www2.census.gov/programs-surveys/decennial/2020/data/demographic-and-housing-characteristics-file/2020-Census-Disclosure-Avoidance-System-Detailed-Summary-Metrics.xlsx) ([2020 Census technical documentation](https://www.census.gov/programs-surveys/decennial-census/technical-documentation/complete-technical-documents.2020.html)), covering race alone, race in combination, number of races, cross-tabulations with Hispanic origin and voting age, and grouped group-quarters counts. |
+| `compute_errors_list` | Per-region L1 errors, signed population biases, and ground-truth totals for each geographic unit (used for distributional and population-binned analyses; per-state only). |
+
+<!-- mdformat on -->
 
 * **Compute Errors for each State**
 
-  ```bash
-  for pass in compute_errors compute_alternate_errors; do
-    for state in "${FOLDER_IDS_2020[@]}"; do
-      python3 census_bluedown/run_pass.py \
-        --pass="${pass}" \
-        --state="${state}" \
-        --in_dir="${SYNTHETIC_GROUND_TRUTH}" \
-        --out_dir="${SYNTHETIC_PROCESSED}"
+    ```bash
+    for replicate in {0..9}; do
+      for pass in compute_errors compute_alternate_errors compute_errors_list; do
+        for state in "${FOLDER_IDS_2020[@]}"; do
+          python3 census_bluedown/run_pass.py \
+            --pass="${pass}" \
+            --state="${state}" \
+            --in_dir="${SYNTHETIC_GROUND_TRUTH}" \
+            --out_dir="${SYNTHETIC_PROCESSED}/${replicate}"
+        done
+      done
     done
-  done
-  ```
+    ```
 
 * **Aggregating Errors across States**
 
-  Aggregates state-level error metrics into national summary reports:
+    Aggregates state-level error metrics into national summary reports:
 
-  ```bash
-  for pass in compute_errors compute_alternate_errors; do
-    python3 census_bluedown/run_pass.py \
-      --pass="${pass}" \
-      --out_dir="${SYNTHETIC_PROCESSED}"
-  done
-  ```
+    ```bash
+    for replicate in {0..9}; do
+      for pass in compute_errors compute_alternate_errors; do
+        python3 census_bluedown/run_pass.py \
+          --pass="${pass}" \
+          --out_dir="${SYNTHETIC_PROCESSED}/${replicate}"
+      done
+    done
+    ```
+
+## Repository Structure
+
+All Python modules reside under `census_bluedown/`.
+
+<!-- mdformat off(prevent table wrapping) -->
+
+### Core Data Structures and Succinct Representations
+
+| Module | Description | Unit Tests |
+| :--- | :--- | :--- |
+| `estimate.py` | Defines `Estimate`, `Covariance`, `DenseCovariance`, `Constraint`, and `DenseConstraint` for representing estimates, covariance matrices, and linear equality constraints. | `estimate_test.py` |
+| `succinct.py` | Defines `SuccinctCovariance`, `SuccinctInputCovariance`, `SuccinctWorkload`, and `SuccinctConstraint` for representing covariance matrices, query workloads, and linear equality constraints succinctly in Kronecker product form. | `succinct_test.py` |
+| `query_encoding.py` | Defines the encoding of Census query shapes (including the grouped `HHINSTLEVELS` query), projections of detailed histograms and optimization variables to a query shape, and utilities for compressing query shapes, variances, and values into succinct workloads and covariance structures. | `query_encoding_test.py` |
+| `constants.py` | Defines constants and configuration settings used in the algorithm, including the solver type, column names for Pandas DataFrames, query shapes, and parameters for the tree hierarchy. | — |
+| `io.py` | Defines `InputFormatIO` and `ProcessingFormatIO` for reading and writing input Noisy Measurement Files (NMF), constraints, and processed estimates in Parquet and pickle formats. | `io_test.py` |
+
+### Main Algorithm
+
+| Module | Description | Unit Tests |
+| :--- | :--- | :--- |
+| `regression.py` | Implements generalized least squares (GLS) query processing and minimum-variance linear combination of independent estimates using succinct covariance matrices. | `regression_test.py` |
+| `constrain.py` | Applies linear equality constraints (sum constraints, first-feature zero constraints, and multifeature zero constraints) to block estimates via GLS projection. | `constrain_test.py` |
+| `linear_postprocessing.py` | Implements the tree-structured Best Linear Unbiased Estimator (BLUE) passes: block-level GLS processing, bottom-up aggregation, and top-down exclusive/combined estimate propagation. | `linear_postprocessing_test.py` |
+| `nonlinear_solver.py` | Formulates and solves the non-negative constrained L2 and rounder optimization problems at each node using MathOpt (Gurobi or SCIP) with succinct precision matrices. | `nonlinear_solver_test.py` |
+| `nonlinear_postprocessing.py` | Orchestrates non-linear postprocessing across parent-child levels of a geographic subtree. | — |
+| `root_optimization.py` | Formulates and solves the root-level (US national total) non-linear optimization and rounder passes. | — |
+| `root.py` | Coordinates root-level bottom-up, top-down, and baseline Census TopDown passes across state subtrees. | — |
+| `main_passes.py` | Coordinates the end-to-end input, bottom-up, optimization top-down, and baseline Census TopDown passes for individual state subtrees. | — |
+
+### Synthetic Data Generation, Evaluation, and CLI Entry Points
+
+| Module | Description | Unit Tests |
+| :--- | :--- | :--- |
+| `ground_truth.py` | Generates ground-truth histograms from Census Privacy-Protected Microdata Files (PPMF). | `ground_truth_test.py` |
+| `nmf.py` | Generates synthetic Noisy Measurement Files (NMF) by adding discrete Gaussian noise to ground-truth histograms. | — |
+| `generate_synthetic_data.py` | CLI entry point for generating ground-truth and synthetic NMF datasets. | — |
+| `compute_errors.py` | Computes and aggregates L1 error metrics across geographic levels and queries comparing postprocessed estimates against ground truth. | `compute_errors_test.py` |
+| `run_pass.py` | Main CLI entry point for running bottom-up, top-down, baseline Census TopDown, and error computation passes. | — |
+
+<!-- mdformat on -->
 
 ## License
 
@@ -331,6 +436,7 @@ If you use this code or algorithm in your research, or just want to refer to it,
 please cite our paper:
 
 <!-- mdlint off(SNIPPET_INVALID_LANGUAGE) -->
+
 ```bibtex
 @misc{ghazi2026bluedown,
   title={Denoising the US Census: Succinct Block Hierarchical Regression},

@@ -17,7 +17,6 @@
 
 from absl import logging
 
-from census_bluedown import block
 from census_bluedown import constants
 from census_bluedown import constrain
 from census_bluedown import io
@@ -36,11 +35,19 @@ OPTIMIZED_EST_FNAME = constants.OPTIMIZED_EST_FNAME
 BASELINE_EST_FNAME = constants.BASELINE_EST_FNAME
 
 
+def _require(df, description: str, subtree_io: io.AbstractBlockHierarchicalIO):
+  """Raises FileNotFoundError if df is None, i.e. no file was found."""
+  if df is None:
+    raise FileNotFoundError(
+        f'No {description} found in {subtree_io.path_prefix} for subtree'
+        f' {subtree_io.subtree_folder!r}.'
+    )
+
+
 def input_pass(
     input_io: io.AbstractBlockHierarchicalIO,
     constraint_io: io.AbstractBlockHierarchicalIO,
     out_io: io.AbstractBlockHierarchicalIO,
-    block_shape: block.BlockShape,
     constraint_out_io: io.AbstractBlockHierarchicalIO | None,
 ):
   """Input pass of the block hierarchical postprocessing algorithm.
@@ -52,35 +59,36 @@ def input_pass(
       Measurement Files (NMF).
     constraint_io: IO object for reading the constraint DataFrame
     out_io: The IO object for writing the output DataFrame.
-    block_shape: The BlockShape object describing the block structure.
     constraint_out_io: The IO object for writing the constraint DataFrame. If
       None, the constraint DataFrame is not copied.
+
+  Raises:
+    FileNotFoundError: If no level of the subtree has input data.
   """
+  processed_df = None
   for level in LEVELS:
     if input_io.exists(level, BLOCK_EST_FNAME):
       input_df = input_io.read(level, filename=constants.NMF_FNAME)
       processed_df = linear_postprocessing.process_blocks(
-          block_shape=block_shape,
           df=input_df)
-      if (constraint_io.exists(level, CONSTRAINT_FNAME) and
-          constants.CONSTRAIN_BOTTOM_UP):
+      if constraint_io.exists(level, CONSTRAINT_FNAME):
         constraint_df = constraint_io.read(
             level=level,
             filename=CONSTRAINT_FNAME)
         processed_df = constrain.constrain_blocks(
-            block_shape=block_shape,
             df=processed_df,
-            constraint_df=constraint_df)
+            constraint_df=constraint_df,
+        )
         if constraint_out_io is not None:
           constraint_out_io.write(
               level=level, filename=CONSTRAINT_FNAME, df=constraint_df)
       out_io.write(level=level, filename=BLOCK_EST_FNAME, df=processed_df)
+  _require(processed_df, 'input data', input_io)
 
 
 def bottom_up_pass(
     in_io: io.AbstractBlockHierarchicalIO,
     out_io: io.AbstractBlockHierarchicalIO,
-    block_shape: block.BlockShape,
 ):
   """Bottom up pass of the block hierarchical postprocessing algorithm.
 
@@ -95,7 +103,9 @@ def bottom_up_pass(
       estimates.
     out_io: The IO object for writing the DataFrame containing the lower
       inclusive estimates.
-    block_shape: The BlockShape object describing the block structure.
+
+  Raises:
+    FileNotFoundError: If no level of the subtree has a block estimate file.
   """
   children_lower_df = None
 
@@ -111,17 +121,16 @@ def bottom_up_pass(
         logging.info('Bottom up pass: parent level %s', level)
         parents_input_df = in_io.read(level, BLOCK_EST_FNAME)
         processed_df = linear_postprocessing.bottom_up_step(
-            block_shape=block_shape,
             children_lower_df=children_lower_df,
             parents_input_df=parents_input_df)
         out_io.write(level=level, filename=LOWER_EST_FNAME, df=processed_df)
         children_lower_df = processed_df
+  _require(children_lower_df, 'block estimates', in_io)
 
 
 def top_down_pass(
     in_io: io.AbstractBlockHierarchicalIO,
     out_io: io.AbstractBlockHierarchicalIO,
-    block_shape: block.BlockShape,
     subtree_only: bool = False):
   """Top down pass of the block hierarchical postprocessing algorithm.
 
@@ -143,8 +152,10 @@ def top_down_pass(
       down to this subtree).
     out_io: The IO object for writing the DataFrame containing the upper
       inclusive estimates and combined estimates.
-    block_shape: The BlockShape object describing the block structure.
     subtree_only: Whether to treat the subtree root as the root of the tree.
+
+  Raises:
+    FileNotFoundError: If the top level of the subtree has no estimate file.
   """
   parents_upper_df = None
 
@@ -173,7 +184,6 @@ def top_down_pass(
           children_lower_df = children_input_df
         children_upper_df, children_combined_df = (
             linear_postprocessing.top_down_step(
-                block_shape=block_shape,
                 children_input_df=children_input_df,
                 children_lower_df=children_lower_df,
                 parents_upper_df=parents_upper_df))
@@ -184,13 +194,14 @@ def top_down_pass(
                      filename=COMBINED_EST_FNAME,
                      df=children_combined_df)
         parents_upper_df = children_upper_df
+  _require(parents_upper_df, 'top-level estimate', in_io)
 
 
 def optimization_top_down_pass(
     in_io: io.ProcessingFormatIO,
     out_io: io.AbstractBlockHierarchicalIO,
     constraint_io: io.AbstractBlockHierarchicalIO,
-    block_shape: block.BlockShape):
+):
   """Top down optimization pass of block hierarchical postprocessing algorithm.
 
   Perform the top down step of the optimization postprocessing algorithm for
@@ -208,7 +219,10 @@ def optimization_top_down_pass(
     out_io: The IO object for writing the DataFrame containing the optimized
       estimates.
     constraint_io: The IO object for reading the constraint DataFrame.
-    block_shape: The BlockShape object describing the block structure.
+
+  Raises:
+    FileNotFoundError: If the top level of the subtree has no optimized
+      estimate file.
   """
   parents_optimization_df = None
 
@@ -239,7 +253,6 @@ def optimization_top_down_pass(
             filename=CONSTRAINT_FNAME)
 
         child_opt_df = nonlinear_postprocessing.optimization_top_down_step(
-            block_shape=block_shape,
             children_level=level,
             children_lower_df=children_lower_df,
             parents_optimization_df=parents_optimization_df,
@@ -249,13 +262,14 @@ def optimization_top_down_pass(
                      filename=OPTIMIZED_EST_FNAME,
                      df=child_opt_df)
         parents_optimization_df = child_opt_df
+  _require(parents_optimization_df, 'top-level optimized estimate', in_io)
 
 
 def baseline_census_top_down_pass(
     in_io: io.AbstractBlockHierarchicalIO,
     out_io: io.AbstractBlockHierarchicalIO,
     constraint_io: io.AbstractBlockHierarchicalIO,
-    block_shape: block.BlockShape):
+):
   """Top down optimization pass of block hierarchical postprocessing algorithm.
 
   Perform the baseline top down postprocessing algorithm for each level in the
@@ -272,7 +286,10 @@ def baseline_census_top_down_pass(
     out_io: The IO object for writing the DataFrame containing the basline
       optimized estimates.
     constraint_io: The IO object for reading the constraint DataFrame.
-    block_shape: The BlockShape object describing the block structure.
+
+  Raises:
+    FileNotFoundError: If the top level of the subtree has no baseline
+      estimate file.
   """
   parents_baseline_df = None
 
@@ -293,7 +310,6 @@ def baseline_census_top_down_pass(
             filename=CONSTRAINT_FNAME)
 
         child_base_df = nonlinear_postprocessing.baseline_census_top_down_step(
-            block_shape=block_shape,
             children_level=level,
             children_input_df=children_input_df,
             parents_baseline_df=parents_baseline_df,
@@ -303,3 +319,4 @@ def baseline_census_top_down_pass(
                      filename=BASELINE_EST_FNAME,
                      df=child_base_df)
         parents_baseline_df = child_base_df
+  _require(parents_baseline_df, 'top-level baseline estimate', out_io)

@@ -82,5 +82,115 @@ class EstimateTest(parameterized.TestCase):
     np.testing.assert_allclose(est_sum23.cov, est_sum123_minus_1.cov)
 
 
+class SmallDenseConstraint(estimate.DenseConstraint):
+  """DenseConstraint over a small (2, 2, 3) feature layout for testing."""
+
+  feature_shapes = (2, 2, 3)
+  dim = 12
+  first_feature_stride = 6
+
+
+class DenseConstraintTest(parameterized.TestCase):
+
+  def setUp(self):
+    super().setUp()
+    np.random.seed(0)
+    self.n = SmallDenseConstraint.dim
+    a = np.random.randn(self.n, self.n)
+    self.cov = a @ a.T + np.eye(self.n)
+    self.val = np.random.randn(self.n)
+    self.est = estimate.Estimate(self.val, self.cov)
+
+  def test_empty(self):
+    cons = SmallDenseConstraint.empty()
+    self.assertTrue(cons.is_empty)
+    self.assertEqual(cons.R.shape, (0, self.n))
+    self.assertIs(cons.apply(self.est), self.est)
+
+  def test_sum(self):
+    cons = SmallDenseConstraint.sum(7.0)
+    self.assertFalse(cons.is_empty)
+    np.testing.assert_allclose(cons.R, np.ones((1, self.n)))
+    np.testing.assert_allclose(cons.c, [7.0])
+
+  @parameterized.named_parameters(
+      ("first_feature_only", [True, False], None, [0, 1, 2, 3, 4, 5]),
+      ("multifeature_only", [False, False], (1, 0), [6, 7, 8]),
+      ("disjoint", [True, False], (1, 1), [0, 1, 2, 3, 4, 5, 9, 10, 11]),
+      ("overlapping", [True, False], (0, 1), [0, 1, 2, 3, 4, 5]),
+  )
+  def test_zero_constraints(self, first_feature, multifeature, expected):
+    cons = SmallDenseConstraint.zero_constraints(first_feature, multifeature)
+    np.testing.assert_allclose(cons.R, np.eye(self.n)[expected])
+    np.testing.assert_allclose(cons.c, np.zeros(len(expected)))
+
+  def test_zero_constraints_none_is_empty(self):
+    self.assertTrue(
+        SmallDenseConstraint.zero_constraints([False, False]).is_empty
+    )
+
+  def test_apply_satisfies_constraint(self):
+    cons = SmallDenseConstraint.zero_constraints([True, False], (1, 0))
+    new_est = cons.apply(self.est)
+    np.testing.assert_allclose(cons.R @ new_est.val, cons.c, atol=1e-8)
+    np.testing.assert_allclose(
+        cons.R @ new_est.cov, np.zeros_like(cons.R), atol=1e-8
+    )
+
+  def test_apply_matches_rls_formula(self):
+    cons = SmallDenseConstraint.sum(7.0)
+    new_est = cons.apply(self.est)
+    R, c = cons.R, cons.c  # pylint: disable=invalid-name
+    L = self.cov @ R.T @ np.linalg.pinv(R @ self.cov @ R.T)  # pylint: disable=invalid-name
+    np.testing.assert_allclose(
+        new_est.val, self.val - L @ (R @ self.val - c), atol=1e-8
+    )
+    np.testing.assert_allclose(
+        new_est.cov, self.cov - L @ R @ self.cov, atol=1e-8
+    )
+
+  def test_apply_dense_covariance(self):
+    est = estimate.Estimate(self.val, estimate.DenseCovariance(self.cov))
+    cons = SmallDenseConstraint.sum(7.0)
+    new_est = cons.apply(est)
+    self.assertIsInstance(new_est.cov, estimate.DenseCovariance)
+    np.testing.assert_allclose(
+        new_est.cov.matrix, cons.apply(self.est).cov, atol=1e-8
+    )
+
+  def test_apply_is_idempotent(self):
+    cons = SmallDenseConstraint.zero_constraints([True, False], (1, 0))
+    once = cons.apply(self.est)
+    twice = cons.apply(once)
+    np.testing.assert_allclose(twice.val, once.val, atol=1e-8)
+    np.testing.assert_allclose(twice.cov, once.cov, atol=1e-8)
+
+  def test_apply_is_order_invariant(self):
+    # Overlapping constraints: both fix entries 3, 4, 5 to zero; the sum
+    # constraint overlaps with every entry.
+    cons_1 = SmallDenseConstraint.zero_constraints([True, False])
+    cons_2 = SmallDenseConstraint.zero_constraints([False, False], (0, 1))
+    cons_3 = SmallDenseConstraint.sum(7.0)
+    stacked = SmallDenseConstraint(
+        np.vstack([cons_1.R, cons_2.R, cons_3.R]),
+        np.concatenate([cons_1.c, cons_2.c, cons_3.c]),
+    )
+    expected = stacked.apply(self.est)
+
+    for order in ((cons_1, cons_2, cons_3), (cons_3, cons_2, cons_1)):
+      actual = self.est
+      for cons in order:
+        actual = cons.apply(actual)
+      np.testing.assert_allclose(actual.val, expected.val, atol=1e-8)
+      np.testing.assert_allclose(actual.cov, expected.cov, atol=1e-8)
+
+  def test_estimate_constrain_delegates_to_apply(self):
+    cons = SmallDenseConstraint.sum(7.0)
+    expected = cons.apply(self.est)
+    actual = self.est.constrain(cons)
+    np.testing.assert_allclose(actual.val, expected.val)
+    np.testing.assert_allclose(actual.cov, expected.cov)
+
+
 if __name__ == "__main__":
   absltest.main()

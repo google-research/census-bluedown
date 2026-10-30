@@ -15,10 +15,7 @@
 """Optimization pass for histograms on blocks of estimates."""
 
 import logging
-
 import pandas as pd
-
-from census_bluedown import block
 from census_bluedown import constants
 from census_bluedown import nonlinear_solver
 
@@ -35,7 +32,6 @@ FIRST_FEATURE_LB_CONSTRAINT = constants.FIRST_FEATURE_LB_CONSTRAINT
 
 
 def optimization_top_down_step(
-    block_shape: block.BlockShape,
     children_level: str,
     children_lower_df: pd.DataFrame,
     parents_optimization_df: pd.DataFrame,
@@ -44,7 +40,6 @@ def optimization_top_down_step(
   """Top down optimization step for linear postprocessing.
 
   Args:
-    block_shape: The BlockShape object describing the block structure.
     children_level: The level of the children.
     children_lower_df: A DataFrame with columns ID and ESTIMATE containing lower
       inclusive estimates of the children.
@@ -71,13 +66,9 @@ def optimization_top_down_step(
       for row_id, row in children_constraint_df[lb_mask].iterrows()}
 
   if children_level in constants.SINGLE_PASS_LEVELS:
-    objective_function_types = (constants.ALTERNATE_PASSES
-                                if constants.USE_ALTERNATE_PASSES
-                                else constants.FULL_PASSES)
+    objective_function_types = constants.FULL_PASSES
   elif children_level in constants.MULTI_PASS_LEVELS:
-    objective_function_types = (constants.ALTERNATE_PASSES
-                                if constants.USE_ALTERNATE_PASSES
-                                else constants.ALL_PASSES)
+    objective_function_types = constants.ALL_PASSES
   else:
     raise ValueError('Unspecified optimization passes for level '
                      f'{children_level}')
@@ -88,7 +79,6 @@ def optimization_top_down_step(
                  i, len(children_grouped), children_level)
     optimized_children_dict.update(
         nonlinear_solver.run_node_optimization_passes(
-            block_shape=block_shape,
             objective_function_types=objective_function_types,
             parent_geocode=parent_geocode,
             child_geocodes=row[ID],
@@ -105,7 +95,6 @@ def optimization_top_down_step(
 
 
 def baseline_census_top_down_step(
-    block_shape: block.BlockShape,
     children_level: str,
     children_input_df: pd.DataFrame,
     parents_baseline_df: pd.DataFrame,
@@ -114,7 +103,6 @@ def baseline_census_top_down_step(
   """Top down optimization step for linear postprocessing.
 
   Args:
-    block_shape: The BlockShape object describing the block structure.
     children_level: The level of the children.
     children_input_df: A DataFrame with columns ID, QUERY_SHAPE, VALUE and
       VARIANCE containing input estimates of the children.
@@ -143,13 +131,9 @@ def baseline_census_top_down_step(
       for row_id, row in children_constraint_df[lb_mask].iterrows()}
 
   if children_level in constants.SINGLE_PASS_LEVELS:
-    objective_function_types = (constants.ALTERNATE_PASSES
-                                if constants.USE_ALTERNATE_PASSES
-                                else constants.FULL_PASSES)
+    objective_function_types = constants.FULL_PASSES
   elif children_level in constants.MULTI_PASS_LEVELS:
-    objective_function_types = (constants.ALTERNATE_PASSES
-                                if constants.USE_ALTERNATE_PASSES
-                                else constants.ALL_PASSES)
+    objective_function_types = constants.ALL_PASSES
   else:
     raise ValueError('Unspecified optimization passes for level '
                      f'{children_level}')
@@ -166,7 +150,6 @@ def baseline_census_top_down_step(
       parent_geocode = parent_geocode[:-1]
     optimized_children_dict.update(
         nonlinear_solver.run_node_baseline_passes(
-            block_shape=block_shape,
             objective_function_types=objective_function_types,
             parent_geocode=parent_geocode,
             child_geocodes=row[ID],
@@ -190,11 +173,11 @@ def baseline_census_top_down_step(
         )
     )
 
-    # Include in the output parents with no children, since they may have
-    # children in lower levels.
-    children_grouped_keys = children_grouped.index
-    for geocode in parents_baseline_df.index:
-      if geocode not in children_grouped_keys:
-        optimized_children_dict[geocode] = parents_baseline_df[VALUE][geocode]
+  # Include in the output parents with no children, since they may have
+  # children in lower levels.
+  children_grouped_keys = children_grouped.index
+  for geocode in parents_baseline_df.index:
+    if geocode not in children_grouped_keys:
+      optimized_children_dict[geocode] = parents_baseline_df[VALUE][geocode]
 
   return pd.DataFrame(optimized_children_dict.items(), columns=[ID, VALUE])

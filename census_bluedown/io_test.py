@@ -28,14 +28,26 @@ Estimate = estimate.Estimate
 
 class IoTest(absltest.TestCase):
 
+  @mock.patch('os.path.exists')
+  def test_read_only_io_requires_existing_directory(self, mock_exists):
+    mock_exists.return_value = False
+    with self.assertRaises(FileNotFoundError):
+      io.InputFormatIO('/cns/missing', 'State=01', read_only=True)
+    with self.assertRaises(FileNotFoundError):
+      io.ProcessingFormatIO('/cns/missing', 'State=01', read_only=True)
+    # Writable IO objects create their directories, so no check is made.
+    io.ProcessingFormatIO('/cns/missing', 'State=01', read_only=False)
+    mock_exists.assert_has_calls([mock.call('/cns/missing')] * 2)
+    self.assertEqual(mock_exists.call_count, 2)
+
   @mock.patch.object(pd, 'read_parquet')
   @mock.patch('builtins.open')
   @mock.patch('os.listdir')
+  @mock.patch('os.path.exists')
   def test_InputFormatIO_read(
-      self,
-      mock_list_dir,
-      mock_open,
-      mock_read_parquet):
+      self, mock_exists, mock_list_dir, mock_open, mock_read_parquet
+  ):
+    del mock_exists
     path_prefix = './data'
     subtree_folder = 'State=01'
     read_only = True
@@ -94,7 +106,9 @@ class IoTest(absltest.TestCase):
     )
 
   @mock.patch('os.listdir')
-  def test_InputFormatIO_exists(self, mock_list_dir):
+  @mock.patch('os.path.exists')
+  def test_InputFormatIO_exists(self, mock_exists, mock_list_dir):
+    del mock_exists
     path_prefix = './data'
     subtree_folder = 'State=01'
     read_only = True
@@ -114,7 +128,11 @@ class IoTest(absltest.TestCase):
 
   @mock.patch.object(pd, 'read_parquet')
   @mock.patch.object(pd, 'read_pickle')
-  def test_ProcessingFormatIO_read(self, mock_read_pickle, mock_read_parquet):
+  @mock.patch('os.path.exists')
+  def test_ProcessingFormatIO_read(
+      self, mock_exists, mock_read_pickle, mock_read_parquet
+  ):
+    del mock_exists
     path_prefix = './data'
     subtree_folder = 'State=01'
     read_only = True
@@ -275,7 +293,11 @@ class IoTest(absltest.TestCase):
         [y.val for y in [Estimate(val1, cov1), Estimate(val2, cov2)]])
     np.testing.assert_allclose(
         [x.cov for x in df_packed[constants.ESTIMATE]],
-        [y.cov for y in [Estimate(val1, cov1), Estimate(val2, cov2)]])
+        [
+            np.asarray(y.cov)
+            for y in [Estimate(val1, cov1), Estimate(val2, cov2)]
+        ],
+    )
 
   def test_split_estimates(self):
     id1 = '01'

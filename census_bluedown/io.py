@@ -26,6 +26,7 @@ import pandas as pd
 
 from census_bluedown import constants
 from census_bluedown import estimate
+from census_bluedown import succinct
 
 
 ROOT_LEVEL = constants.ROOT_LEVEL
@@ -38,10 +39,24 @@ Estimate = estimate.Estimate
 
 @dataclasses.dataclass
 class AbstractBlockHierarchicalIO(abc.ABC):
-  """Abstract class for input/output for block hierarchical aggregation."""
+  """Abstract class for input/output for block hierarchical aggregation.
+
+  Attributes:
+    path_prefix: Root directory of the data.
+    subtree_folder: Subfolder for the current subtree (e.g. 'State=01').
+    read_only: Whether writes are forbidden. A read-only IO object requires
+      path_prefix to exist, since a missing input directory would otherwise be
+      indistinguishable from one with no data for any level.
+  """
   path_prefix: str
   subtree_folder: str
   read_only: bool = True
+
+  def __post_init__(self):
+    if self.read_only and not os.path.exists(self.path_prefix):
+      raise FileNotFoundError(
+          f'Input directory does not exist: {self.path_prefix}'
+      )
 
   @abc.abstractmethod
   def read(self, level: str, filename: str | None) -> pd.DataFrame:
@@ -248,10 +263,20 @@ def pack_estimates(df: pd.DataFrame) -> pd.DataFrame:
     raise ValueError(
         f'Cannot pack nonexistent {VARIANCE} column into Estimate.'
     )
-  var_shape = int(len(df[VARIANCE].iloc[0])**0.5)
-  df[ESTIMATE] = df.apply(
-      lambda x: Estimate(x[VALUE], x[VARIANCE].reshape((var_shape, -1))), axis=1
-  )
+  succinct_len = 2 * succinct.SuccinctCovariance.coefficient_dim**2
+  if len(df[VARIANCE].iloc[0].flatten()) == succinct_len:
+    df[ESTIMATE] = df.apply(
+        lambda x: Estimate(
+            x[VALUE], succinct.SuccinctCovariance.from_flattened(x[VARIANCE])
+        ),
+        axis=1,
+    )
+  else:
+    var_shape = int(len(df[VARIANCE].iloc[0]) ** 0.5)
+    df[ESTIMATE] = df.apply(
+        lambda x: Estimate(x[VALUE], x[VARIANCE].reshape((var_shape, -1))),
+        axis=1,
+    )
 
   return df.drop(columns=[VALUE, VARIANCE])
 

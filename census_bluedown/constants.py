@@ -14,11 +14,9 @@
 
 """Constants used in the block hierarchical postprocessing algorithm."""
 import enum
+import math
 
-CONDITION_SCALING = 50
-USE_ALTERNATE_PASSES = False
-# Whether to use equality constraints for the bottom-up pass.
-CONSTRAIN_BOTTOM_UP = True
+ALPHA_VALUES = (10, 50, 5, 100, 1, 500, 0.1)
 
 
 # Nonlinear solver type
@@ -48,8 +46,15 @@ FIRST_FEATURE_LB_CONSTRAINT = 'hhgq_total_lb_con'
 # corresponding to the constraint that no minors live in nursing facilities.
 MULTIFEATURE_ZERO_SEQUENCE = (3, 0)
 
-# Shape of the detailed query used for the census application.
+# Shape of the detailed query used for the census application. The first three
+# features are treated as asymmetric; the last (race) is treated as symmetric.
 DETAILED_QUERY_SHAPE = (8, 2, 2, 63)
+# Dimensions of the Kronecker factors in the succinct representation (see
+# succinct.py): the product of the asymmetric feature sizes and the size of the
+# symmetric feature.
+COEFFICIENT_DIM = math.prod(DETAILED_QUERY_SHAPE[:-1])  # 32
+PROJECTION_DIM = DETAILED_QUERY_SHAPE[-1]  # 63
+TOTAL_LEN = math.prod(DETAILED_QUERY_SHAPE)
 TOTAL_QUERY_SHAPE = (1, 1, 1, 1)
 
 CENSUS_ASYMMETRIC_QUERY_SHAPE = (3, 1, 1, 1)
@@ -123,7 +128,7 @@ REGIONS_PER_LEVEL_2020 = {
 }
 REGIONS_PER_LEVEL = REGIONS_PER_LEVEL_2020
 
-# File names for Pandas DataFrames.
+# File names for Pandas DataFrames
 PICKLE_EXTENSION = '.pickle'
 PARQUET_EXTENSION = '.parquet'
 EXTENSION = PARQUET_EXTENSION
@@ -140,13 +145,9 @@ OPTIMIZED_EST_FNAME = 'optimized_estimate' + EXTENSION
 BASELINE_EST_FNAME = 'baseline_estimate' + EXTENSION
 ERRORS_FNAME = 'query_errors' + EXTENSION
 ALTERNATE_ERRORS_FNAME = 'alternate_query_errors' + EXTENSION
+ERRORS_LIST_FNAME = 'query_errors_list' + EXTENSION
 
 
-if not CONSTRAIN_BOTTOM_UP:
-  BLOCK_EST_FNAME = 'block_unconstrained' + EXTENSION
-  LOWER_EST_FNAME = 'lower_unconstrained' + EXTENSION
-  COMBINED_EST_FNAME = 'combined_unconstrained' + EXTENSION
-  OPTIMIZED_EST_FNAME = 'optimized_unconstrained' + EXTENSION
 # pylint: enable=invalid-name
 
 
@@ -172,6 +173,3 @@ ALL_PASSES = (ObjectiveFunctionType.TOTAL_ONLY,
               ObjectiveFunctionType.FULL,
               ObjectiveFunctionType.TOTAL_ONLY_ROUNDER,
               ObjectiveFunctionType.FULL_ROUNDER)
-ALTERNATE_PASSES = (
-    ObjectiveFunctionType.TOTAL_ONLY,
-    ObjectiveFunctionType.FULL,)

@@ -20,7 +20,6 @@ from absl import logging
 import numpy as np
 import pandas as pd
 
-from census_bluedown import block
 from census_bluedown import constants
 from census_bluedown import constrain
 from census_bluedown import estimate
@@ -58,7 +57,6 @@ def root_input_pass(
     in_io: io.AbstractBlockHierarchicalIO,
     constraint_io: io.AbstractBlockHierarchicalIO,
     out_io: io.AbstractBlockHierarchicalIO,
-    block_shape: block.BlockShape,
     constraint_out_io: io.AbstractBlockHierarchicalIO | None,
 ) -> pd.DataFrame:
   """Input pass for root level of block hierarchical postprocessing algorithm.
@@ -71,7 +69,6 @@ def root_input_pass(
       Measurement File (NMF).
     constraint_io: IO object for reading the constraint DataFrame
     out_io: The IO object for writing the output DataFrame.
-    block_shape: The BlockShape object describing the block structure.
     constraint_out_io: The IO object for writing the constraint DataFrame. If
       None, the constraint DataFrame is not copied.
 
@@ -85,14 +82,13 @@ def root_input_pass(
       filename=CONSTRAINT_FNAME)
 
   processed_df = linear_postprocessing.process_blocks(
-      block_shape=block_shape,
       df=input_df)
 
-  if constraint_df is not None and constants.CONSTRAIN_BOTTOM_UP:
+  if constraint_df is not None:
     processed_df = constrain.constrain_blocks(
-        block_shape=block_shape,
         df=processed_df,
-        constraint_df=constraint_df)
+        constraint_df=constraint_df,
+    )
     if constraint_out_io is not None:
       constraint_out_io.write(level=ROOT_LEVEL,
                               filename=CONSTRAINT_FNAME,
@@ -122,7 +118,6 @@ def read_subtree_folder_lower_estimate(
     A DataFrame with columns ID and ESTIMATE consisting of the lower estimate of
     the subtree.
   """
-
   # Return lower estimate from top level at which it exists.
   for level in LEVELS:
     if subtree_io.exists(level=level, filename=LOWER_EST_FNAME):
@@ -225,9 +220,8 @@ def write_processed_subtree_estimates(
 
 def subtree_constrained_lower_estimates(
     subtree_io: io.AbstractBlockHierarchicalIO,
-    block_shape: block.BlockShape,
     subtree_totals: pd.DataFrame,
-    subtree_geocode_patterns: Sequence[str] = SUBTREE_GEOCODE_PATTERNS
+    subtree_geocode_patterns: Sequence[str] = SUBTREE_GEOCODE_PATTERNS,
 ) -> pd.DataFrame:
   """Compute constrained lower estimates for combined subtrees.
 
@@ -239,7 +233,6 @@ def subtree_constrained_lower_estimates(
 
   Args:
     subtree_io: The IO object for reading lower estimates from the subtree.
-    block_shape: The BlockShape object describing the block structure.
     subtree_totals: A DataFrame with columns ID and VALUE containing the
       statewide totals for each subtree.
     subtree_geocode_patterns: String formats for geocodes with given subtree ID.
@@ -259,14 +252,12 @@ def subtree_constrained_lower_estimates(
                        for x in subtree_estimate_dict[subtree_id]])
 
     # Apply statewide total constraint and append to list
-    if constants.CONSTRAIN_BOTTOM_UP:
-      lower_estimates.append(
-          constrain.apply_sum_constraint(
-              block_shape=block_shape,
-              est=subtree_est,  # pyrefly: ignore[bad-argument-type]
-              total=subtree_totals.loc[subtree_id][VALUE]))
-    else:
-      lower_estimates.append(subtree_est)
+    lower_estimates.append(
+        constrain.apply_sum_constraint(
+            est=subtree_est,  # pyrefly: ignore[bad-argument-type]
+            total=subtree_totals.loc[subtree_id][VALUE],
+        )
+    )
 
   subtree_totals = subtree_totals.reset_index()
   return pd.DataFrame({
@@ -279,7 +270,6 @@ def root_bottom_up_passes(
     constraint_io: io.AbstractBlockHierarchicalIO,
     subtree_totals_io: io.AbstractBlockHierarchicalIO,
     processed_io: io.AbstractBlockHierarchicalIO,
-    block_shape: block.BlockShape,
     constraint_out_io: io.AbstractBlockHierarchicalIO | None,
 ):
   """Process root level for block hierarchical postprocessing algorithm.
@@ -296,7 +286,6 @@ def root_bottom_up_passes(
       subtree.
     processed_io: The IO object for reading the subtree lower estimate
       DataFrames and writing the output DataFrames.
-    block_shape: The BlockShape object describing the block structure.
     constraint_out_io: The IO object for writing the constraint DataFrame. If
       None, the constraint DataFrame is not copied.
   """
@@ -305,17 +294,18 @@ def root_bottom_up_passes(
       in_io=nmf_io,
       constraint_io=constraint_io,
       out_io=processed_io,
-      block_shape=block_shape,
-      constraint_out_io=constraint_out_io)
+      constraint_out_io=constraint_out_io,
+  )
 
   # Bottom-up step, including statewide total constraint
   subtree_totals = subtree_totals_io.read(
       level=ROOT_LEVEL,
       filename=SUBTREE_TOTALS_FNAME)
   subtree_constrained_lower_df = subtree_constrained_lower_estimates(
-      processed_io, block_shape, subtree_totals)
+      processed_io,
+      subtree_totals,
+  )
   processed_root = linear_postprocessing.bottom_up_step(
-      block_shape=block_shape,
       children_lower_df=subtree_constrained_lower_df,
       parents_input_df=root_input_df)
   processed_io.write(
@@ -329,7 +319,6 @@ def root_top_down_pass(
     out_io: io.AbstractBlockHierarchicalIO,
     constraint_io: io.AbstractBlockHierarchicalIO,
     subtree_totals_io: io.AbstractBlockHierarchicalIO,
-    block_shape: block.BlockShape,
 ):
   """Process root level for block hierarchical postprocessing algorithm."""
   subtree_totals = subtree_totals_io.read(
@@ -352,7 +341,6 @@ def root_top_down_pass(
   # the safe side, we do the full pass first.
   logging.info('Running L2 optimization for root node.')
   variables, result = root_optimization.run_root_optimization(
-      block_shape=block_shape,
       objective_function_type=constants.ObjectiveFunctionType.FULL,
       root_geocode='',
       root_est=root_est,
@@ -360,13 +348,12 @@ def root_top_down_pass(
       root_lower_bounds=root_lower_bounds,
       root_total=root_total
   )
-  variable_values = np.array([x if isinstance(x, float)
-                              else result.variable_values(x)
-                              for x in variables])
+  variable_values = np.array(
+      nonlinear_solver.variable_values(result, variables)
+  )
 
   logging.info('Running rounder pass for root node.')
   rounder_variables, rounder_result = root_optimization.run_root_optimization(
-      block_shape=block_shape,
       objective_function_type=constants.ObjectiveFunctionType.FULL_ROUNDER,
       root_geocode='',
       root_est=estimate.Estimate(
@@ -377,9 +364,12 @@ def root_top_down_pass(
       root_total=root_total
   )
 
-  rounder_variable_values = np.array([x if isinstance(x, float)
-                                      else rounder_result.variable_values(x)
-                                      for x in rounder_variables]).astype(int)
+  rounder_variable_values = np.asarray(
+      nonlinear_solver.integer_variable_values(
+          rounder_result, rounder_variables
+      ),
+      dtype=int,
+  )
   root_variable_values = (np.floor(variable_values).astype(int)
                           + rounder_variable_values)
 
@@ -403,13 +393,10 @@ def root_top_down_pass(
 
   processed_subtree_estimate_dict = (
       nonlinear_solver.run_node_optimization_passes(
-          block_shape=block_shape,
-          objective_function_types=(
-              constants.ALTERNATE_PASSES if constants.USE_ALTERNATE_PASSES
-              else constants.ALL_PASSES),
+          objective_function_types=constants.ALL_PASSES,
           parent_geocode='',
           child_geocodes=constants.FOLDER_IDS,
-          parent_val=root_variable_values,
+          parent_val=root_variable_values,  # pyrefly: ignore[bad-argument-type]
           child_ests=subtree_estimates_dict,
           children_upper_bound_dict=children_upper_bound_dict,
           children_lower_bound_dict=children_lower_bound_dict,
@@ -429,9 +416,20 @@ def root_baseline_census_topdown_pass(
     out_io: io.AbstractBlockHierarchicalIO,
     constraint_io: io.AbstractBlockHierarchicalIO,
     subtree_totals_io: io.AbstractBlockHierarchicalIO,
-    block_shape: block.BlockShape,
 ):
-  """Baseline root processing for census TopDown algorithm."""
+  """Baseline root processing mirroring the census TopDown algorithm.
+
+  See https://arxiv.org/abs/2204.08986 for a description of TopDown.
+
+  Args:
+    nmf_io: The input IO object for the noisy measurements, read at the root
+      level and for each state-level subtree.
+    out_io: The output IO object for the baseline estimates of the root node and
+      its children.
+    constraint_io: The input IO object for the constraint data, providing the
+      first feature upper and lower bounds for the root node and its children.
+    subtree_totals_io: The input IO object for the state-level subtree totals.
+  """
   subtree_totals = subtree_totals_io.read(
       level=ROOT_LEVEL,
       filename=SUBTREE_TOTALS_FNAME)
@@ -453,7 +451,6 @@ def root_baseline_census_topdown_pass(
   # the safe side, we do the full pass first.
   logging.info('Running baseline L2 optimization for root node.')
   variables, result = root_optimization.run_baseline_root_optimization(
-      block_shape=block_shape,
       objective_function_type=constants.ObjectiveFunctionType.FULL,
       root_geocode='',
       root_est_dict=root_est_dict,
@@ -461,15 +458,14 @@ def root_baseline_census_topdown_pass(
       root_lower_bounds=root_lower_bounds,
       root_total=root_total
   )
-  variable_values = np.array([x if isinstance(x, float)
-                              else result.variable_values(x)
-                              for x in variables])
+  variable_values = np.array(
+      nonlinear_solver.variable_values(result, variables)
+  )
 
   logging.info('Running baseline rounder pass for root node.')
   # Run regular rounder pass, since it's the same as baseline rounder pass.
   rounder_variables, rounder_result = (
       root_optimization.run_root_optimization(
-          block_shape=block_shape,
           objective_function_type=constants.ObjectiveFunctionType.FULL_ROUNDER,
           root_geocode='',
           root_est=estimate.Estimate(
@@ -481,9 +477,12 @@ def root_baseline_census_topdown_pass(
       )
   )
 
-  rounder_variable_values = np.array([x if isinstance(x, float)
-                                      else rounder_result.variable_values(x)
-                                      for x in rounder_variables]).astype(int)
+  rounder_variable_values = np.asarray(
+      nonlinear_solver.integer_variable_values(
+          rounder_result, rounder_variables
+      ),
+      dtype=int,
+  )
 
   root_variable_values = (np.floor(variable_values).astype(int)
                           + rounder_variable_values)
@@ -508,20 +507,15 @@ def root_baseline_census_topdown_pass(
         zip(map(tuple, subtree_df[QUERY_SHAPE]),
             zip(subtree_df[VALUE], subtree_df[VARIANCE])))
 
-  processed_subtree_estimate_dict = (
-      nonlinear_solver.run_node_baseline_passes(
-          block_shape=block_shape,
-          objective_function_types=(
-              constants.ALTERNATE_PASSES if constants.USE_ALTERNATE_PASSES
-              else constants.ALL_PASSES),
-          parent_geocode='',
-          child_geocodes=constants.FOLDER_IDS,
-          parent_val=root_variable_values,
-          child_ests=subtree_inputs_dict,
-          children_upper_bound_dict=children_upper_bound_dict,
-          children_lower_bound_dict=children_lower_bound_dict,
-          subtree_total_dict=subtree_total_dict,
-      )
+  processed_subtree_estimate_dict = nonlinear_solver.run_node_baseline_passes(
+      objective_function_types=constants.ALL_PASSES,
+      parent_geocode='',
+      child_geocodes=constants.FOLDER_IDS,
+      parent_val=root_variable_values,  # pyrefly: ignore[bad-argument-type]
+      child_ests=subtree_inputs_dict,
+      children_upper_bound_dict=children_upper_bound_dict,
+      children_lower_bound_dict=children_lower_bound_dict,
+      subtree_total_dict=subtree_total_dict,
   )
 
   write_processed_subtree_estimates(
