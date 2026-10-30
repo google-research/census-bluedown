@@ -385,6 +385,51 @@ across geographic levels (`Block`, `Block_Group`, `Tract`, `County`, and
     done
     ```
 
+### 4. Analysis Plots and Tables (`analysis/`)
+
+The figures and LaTeX tables in the paper summarize error metrics over several
+independent replicates of the synthetic NMF generation (with different `--seed`
+values) and postprocessing pipeline. The analysis scripts expect replicate `i`
+to be written under `<input_dir>/<i>/` with the layout produced by the commands
+above (i.e. run sections 1–3 once per replicate with
+`--out_dir="${SYNTHETIC_PROCESSED}/${i}"`).
+
+*   **Generate Plots and Tables from Replicate Outputs**
+
+    Reads the per-replicate error parquets and writes figures (`--formats=pdf`
+    and/or `png`), LaTeX tables, and optionally tidy CSV exports of every
+    plotted series (`--formats=csv`):
+
+    ```bash
+    PLOTS_DIR="output/plots"
+
+    python3 census_bluedown/analysis/generate_plots.py \
+      --input_dir="${SYNTHETIC_PROCESSED}" \
+      --gt_parquet_path="${SYNTHETIC_GROUND_TRUTH}/US.parquet/DPQuery/ground_truth.parquet" \
+      --output_dir="${PLOTS_DIR}" \
+      --num_replicates=10 \
+      --plots=all \
+      --formats=pdf,png,csv
+    ```
+
+    `--plots` accepts any comma-separated subset of `boxplots`,
+    `detailed_queries`, `bias`, `binned_error`, `ridgeline`, `tables`, and
+    `--levels` any subset of `US`, `State`, `County`, `Tract`, `Block_Group`,
+    `Block`.
+
+*   **Regenerate Plots and Tables from Exported CSVs**
+
+    Re-creates the same figures and tables purely from the CSV files exported
+    above, without access to the replicate parquets:
+
+    ```bash
+    python3 census_bluedown/analysis/generate_plots_from_csv.py \
+      --input_dir="${PLOTS_DIR}" \
+      --output_dir="output/plots_from_csv" \
+      --plots=all \
+      --formats=pdf,png
+    ```
+
 ## Repository Structure
 
 All Python modules reside under `census_bluedown/`.
@@ -423,6 +468,22 @@ All Python modules reside under `census_bluedown/`.
 | `generate_synthetic_data.py` | CLI entry point for generating ground-truth and synthetic NMF datasets. | — |
 | `compute_errors.py` | Computes and aggregates L1 error metrics across geographic levels and queries comparing postprocessed estimates against ground truth. | `compute_errors_test.py` |
 | `run_pass.py` | Main CLI entry point for running bottom-up, top-down, baseline Census TopDown, and error computation passes. | — |
+
+### Analysis Plots and Tables (`analysis/`)
+
+| Module | Description | Unit Tests |
+| :--- | :--- | :--- |
+| `common.py` | Geographic level and query constants, output layout, and shared helpers for extracting and normalizing replicate errors. | `common_test.py` |
+| `style.py` | Color palettes and blending helpers. | `style_test.py` |
+| `data_loader.py` | Loads per-replicate error parquets into tidy DataFrames (summary, detailed, population-binned, and per-unit error histograms). | `data_loader_test.py` |
+| `csv_utils.py` | Exports those DataFrames to tidy CSVs and loads them back. | `csv_utils_test.py` |
+| `boxplots.py` | Generates baseline-median-normalized error boxplots across geographic levels and detailed summary queries. | — |
+| `population_bin_plots.py` | Generates population-binned signed bias and absolute L1 error plots. | `population_bin_plots_test.py` |
+| `ridgeline_plots.py` | Generates stacked dual-series KDE ridgeline error distribution plots. | `ridgeline_plots_test.py` |
+| `tables.py` | Generates LaTeX summary tables with paired t-test statistics. | `tables_test.py` |
+| `plot_pipeline.py` | Defines the `PlotSource` protocol, `CsvSource`, and shared `generate()` pipeline used by both CLI entry points. | `plot_pipeline_test.py` |
+| `generate_plots.py` | CLI entry point for generating plots and tables from per-replicate error parquets. | — |
+| `generate_plots_from_csv.py` | CLI entry point for regenerating plots and tables from exported CSVs. | — |
 
 <!-- mdformat on -->
 
